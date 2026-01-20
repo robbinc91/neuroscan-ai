@@ -317,7 +317,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 For issues, questions, or suggestions:
 - 🐛 [Report a Bug](https://github.com/yourusername/neuroscan-ai/issues)
 - 💡 [Request a Feature](https://github.com/yourusername/neuroscan-ai/issues)
-- 📧 Email: your.email@example.com
+- 📧 Email: robbinc@gmail.com
 
 ---
 
