@@ -27,3 +27,4 @@ node_modules
 dist-electron
 release
 .env.local
+.original
