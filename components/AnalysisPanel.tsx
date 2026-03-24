@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from 'recharts';
-import { FileText, Download, Share2, Sparkles, Upload, FileJson } from 'lucide-react';
+import { FileText, Download, Presentation, FileJson, Table2 } from 'lucide-react';
 import { MOCK_METRICS } from '../constants';
 import { VolumeData, SegmentationStats, ReportImages } from '../types';
 import { jsPDF } from "jspdf";
@@ -18,6 +18,123 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ volume, segmentati
     const [labelMapping, setLabelMapping] = useState<Record<string, string>>({});
     const jsonInputRef = useRef<HTMLInputElement>(null);
     const chartRef = useRef<HTMLDivElement>(null);
+
+    const sanitizeFileName = (name: string): string => {
+        return name.replace(/[<>:"/\\|?*\x00-\x1F]/g, '_');
+    };
+
+    const toCsv = () => {
+        const header = 'label,volume_cm3,intensity_mean,intensity_std';
+        const rows = stats.map((s) =>
+            [
+                `"${String(s.label).replace(/"/g, '""')}"`,
+                s.volume.toFixed(4),
+                s.intensityMean.toFixed(4),
+                s.intensityStd.toFixed(4)
+            ].join(',')
+        );
+        return [header, ...rows].join('\n');
+    };
+
+    const getChartImage = async () => {
+        if (!chartRef.current) return '';
+        const canvas = await html2canvas(chartRef.current, { backgroundColor: '#111827' });
+        return canvas.toDataURL('image/png');
+    };
+
+    const buildClinicalSummaryPdf = async (images?: ReportImages) => {
+        const chartImgData = await getChartImage();
+        const doc = new jsPDF();
+        const pageWidth = doc.internal.pageSize.getWidth();
+        const pageHeight = doc.internal.pageSize.getHeight();
+        const margin = 15;
+
+        doc.setFillColor(15, 23, 42);
+        doc.rect(0, 0, pageWidth, pageHeight, 'F');
+
+        doc.setTextColor(255, 255, 255);
+        doc.setFontSize(22);
+        doc.text("NeuroScan AI - Clinical Summary", margin, 20);
+
+        doc.setFontSize(10);
+        doc.setTextColor(148, 163, 184);
+        doc.text(`Date: ${new Date().toLocaleDateString()}`, margin, 30);
+        doc.line(margin, 35, pageWidth - margin, 35);
+
+        if (chartImgData) {
+            doc.addImage(chartImgData, 'PNG', margin, 45, pageWidth - (margin * 2), 80);
+        }
+
+        let yPos = 135;
+        doc.setFontSize(12);
+        doc.setTextColor(34, 211, 238);
+        doc.text("Region Statistics", margin, yPos);
+        yPos += 10;
+
+        doc.setFontSize(10);
+        doc.setTextColor(200, 200, 200);
+        doc.setFillColor(30, 41, 59);
+        doc.rect(margin, yPos - 5, pageWidth - (margin * 2), 8, 'F');
+        doc.text("Region", margin + 2, yPos);
+        doc.text("Vol (cm³)", margin + 60, yPos);
+        doc.text("Mean Int", margin + 100, yPos);
+        doc.text("Std Dev", margin + 140, yPos);
+        yPos += 10;
+
+        stats.forEach((s) => {
+            if (yPos > pageHeight - 20) {
+                doc.addPage();
+                doc.setFillColor(15, 23, 42);
+                doc.rect(0, 0, pageWidth, pageHeight, 'F');
+                yPos = 20;
+            }
+            doc.text(s.label, margin + 2, yPos);
+            doc.text(s.volume.toFixed(2), margin + 60, yPos);
+            doc.text(s.intensityMean.toFixed(1), margin + 100, yPos);
+            doc.text(s.intensityStd.toFixed(1), margin + 140, yPos);
+            yPos += 7;
+        });
+
+        if (images) {
+            const addImageSection = (title: string, imgs: string[]) => {
+                doc.addPage();
+                doc.setFillColor(15, 23, 42);
+                doc.rect(0, 0, pageWidth, pageHeight, 'F');
+                doc.setFontSize(16);
+                doc.setTextColor(34, 211, 238);
+                doc.text(title, margin, 20);
+
+                let x = margin;
+                let y = 30;
+                const w = (pageWidth - (margin * 3)) / 2;
+                const h = w;
+
+                imgs.forEach((img) => {
+                    if (y + h > pageHeight - 10) {
+                        doc.addPage();
+                        doc.setFillColor(15, 23, 42);
+                        doc.rect(0, 0, pageWidth, pageHeight, 'F');
+                        y = 30;
+                        x = margin;
+                    }
+                    doc.addImage(img, 'JPEG', x, y, w, h);
+                    if (x === margin) {
+                        x = margin + w + margin;
+                    } else {
+                        x = margin;
+                        y += h + 10;
+                    }
+                });
+            };
+
+            if (images.axial.length) addImageSection("Axial Slices", images.axial);
+            if (images.coronal.length) addImageSection("Coronal Slices", images.coronal);
+            if (images.sagittal.length) addImageSection("Sagittal Slices", images.sagittal);
+            if (images.threeD.length) addImageSection("3D Reconstructions", images.threeD);
+        }
+
+        return doc;
+    };
 
     // Calculate Segmentation Stats
     useEffect(() => {
@@ -85,126 +202,92 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ volume, segmentati
 
     }, [volume, segmentation, labelMapping]);
 
-    const handleGenerateReport = async () => {
+    const handleClinicalSummaryExport = async () => {
         if (stats.length === 0 || !onGenerateReport) return;
         setGenerating(true);
 
         try {
-            // 1. Capture Viewport Images
             const images = await onGenerateReport();
-
-            // 2. Capture Chart
-            let chartImgData = '';
-            if (chartRef.current) {
-                const canvas = await html2canvas(chartRef.current, { backgroundColor: '#111827' });
-                chartImgData = canvas.toDataURL('image/png');
-            }
-
-            // 3. Generate PDF
-            const doc = new jsPDF();
-            const pageWidth = doc.internal.pageSize.getWidth();
-            const pageHeight = doc.internal.pageSize.getHeight();
-            const margin = 15;
-
-            // --- PAGE 1: Summary ---
-            doc.setFillColor(15, 23, 42); // bg-slate-900
-            doc.rect(0, 0, pageWidth, pageHeight, 'F');
-
-            doc.setTextColor(255, 255, 255);
-            doc.setFontSize(22);
-            doc.text("NeuroScan AI - Volumetric Analysis Report", margin, 20);
-
-            doc.setFontSize(10);
-            doc.setTextColor(148, 163, 184);
-            doc.text(`Patient ID: 9382-AC | Date: ${new Date().toLocaleDateString()}`, margin, 30);
-            doc.line(margin, 35, pageWidth - margin, 35);
-
-            // Chart
-            if (chartImgData) {
-                doc.addImage(chartImgData, 'PNG', margin, 45, pageWidth - (margin * 2), 80);
-            }
-
-            // Statistics Table
-            let yPos = 135;
-            doc.setFontSize(12);
-            doc.setTextColor(34, 211, 238); // Cyan
-            doc.text("Quantitative Statistics", margin, yPos);
-            yPos += 10;
-
-            doc.setFontSize(10);
-            doc.setTextColor(200, 200, 200);
-
-            // Header
-            doc.setFillColor(30, 41, 59);
-            doc.rect(margin, yPos - 5, pageWidth - (margin * 2), 8, 'F');
-            doc.text("Region", margin + 2, yPos);
-            doc.text("Vol (cm³)", margin + 60, yPos);
-            doc.text("Mean Int", margin + 100, yPos);
-            doc.text("Std Dev", margin + 140, yPos);
-            yPos += 10;
-
-            stats.forEach((s) => {
-                if (yPos > pageHeight - 20) {
-                    doc.addPage();
-                    doc.setFillColor(15, 23, 42);
-                    doc.rect(0, 0, pageWidth, pageHeight, 'F');
-                    yPos = 20;
-                }
-                doc.text(s.label, margin + 2, yPos);
-                doc.text(s.volume.toFixed(2), margin + 60, yPos);
-                doc.text(s.intensityMean.toFixed(1), margin + 100, yPos);
-                doc.text(s.intensityStd.toFixed(1), margin + 140, yPos);
-                yPos += 7;
-            });
-
-            // --- PAGE 2: Slices & 3D ---
-            if (images) {
-                const addImageSection = (title: string, imgs: string[]) => {
-                    doc.addPage();
-                    doc.setFillColor(15, 23, 42);
-                    doc.rect(0, 0, pageWidth, pageHeight, 'F');
-
-                    doc.setFontSize(16);
-                    doc.setTextColor(34, 211, 238);
-                    doc.text(title, margin, 20);
-
-                    let x = margin;
-                    let y = 30;
-                    const w = (pageWidth - (margin * 3)) / 2;
-                    const h = w; // Square slices
-
-                    imgs.forEach((img, i) => {
-                        if (y + h > pageHeight - 10) {
-                            doc.addPage();
-                            doc.setFillColor(15, 23, 42);
-                            doc.rect(0, 0, pageWidth, pageHeight, 'F');
-                            y = 30;
-                            x = margin;
-                        }
-
-                        doc.addImage(img, 'JPEG', x, y, w, h);
-
-                        // Grid logic
-                        if (x === margin) {
-                            x = margin + w + margin;
-                        } else {
-                            x = margin;
-                            y += h + 10;
-                        }
-                    });
-                };
-
-                if (images.axial.length) addImageSection("Axial Slices", images.axial);
-                if (images.coronal.length) addImageSection("Coronal Slices", images.coronal);
-                if (images.sagittal.length) addImageSection("Sagittal Slices", images.sagittal);
-                if (images.threeD.length) addImageSection("3D Reconstructions", images.threeD);
-            }
-
-            doc.save("neuroscan_report.pdf");
-
+            const doc = await buildClinicalSummaryPdf(images);
+            const output = doc.output('arraybuffer');
+            await window.electron.saveFile(output, `clinical_summary_${Date.now()}.pdf`, [
+                { name: 'PDF Files', extensions: ['pdf'] }
+            ]);
         } catch (e) {
             console.error(e);
-            alert("Error generating report");
+            alert("Error generating clinical summary PDF");
+        } finally {
+            setGenerating(false);
+        }
+    };
+
+    const handleResearchMetricsExport = async () => {
+        if (stats.length === 0) return;
+
+        try {
+            const csv = toCsv();
+            const csvBuffer = new TextEncoder().encode(csv).buffer as ArrayBuffer;
+            await window.electron.saveFile(csvBuffer, `research_metrics_${Date.now()}.csv`, [
+                { name: 'CSV Files', extensions: ['csv'] }
+            ]);
+        } catch (e) {
+            console.error(e);
+            alert('Error exporting research metrics CSV');
+        }
+    };
+
+    const handlePresentationPackExport = async () => {
+        if (stats.length === 0 || !onGenerateReport) return;
+        setGenerating(true);
+
+        try {
+            const dir = await window.electron.selectDirectory();
+            if (!dir) return;
+
+            const timestamp = Date.now();
+            const bundleName = sanitizeFileName(`presentation_pack_${timestamp}`);
+            const images = await onGenerateReport();
+            const chartImage = await getChartImage();
+            const csv = toCsv();
+            const readme = [
+                'NeuroScan AI Presentation Pack',
+                `Generated: ${new Date().toISOString()}`,
+                '',
+                'Files included:',
+                '- metrics/research_metrics.csv',
+                '- images/chart.png',
+                '- images/axial_*.jpg, coronal_*.jpg, sagittal_*.jpg, 3d_*.jpg'
+            ].join('\n');
+
+            const files: Array<{ relativePath: string; content: string; encoding?: 'utf8' | 'base64' }> = [
+                { relativePath: `${bundleName}/README.txt`, content: readme, encoding: 'utf8' },
+                { relativePath: `${bundleName}/metrics/research_metrics.csv`, content: csv, encoding: 'utf8' }
+            ];
+
+            const pushDataUrl = (relativePath: string, dataUrl: string) => {
+                const [, base64] = dataUrl.split(',');
+                if (!base64) return;
+                files.push({ relativePath, content: base64, encoding: 'base64' });
+            };
+
+            if (chartImage) {
+                pushDataUrl(`${bundleName}/images/chart.png`, chartImage);
+            }
+
+            if (images) {
+                images.axial.forEach((img, i) => pushDataUrl(`${bundleName}/images/axial_${i + 1}.jpg`, img));
+                images.coronal.forEach((img, i) => pushDataUrl(`${bundleName}/images/coronal_${i + 1}.jpg`, img));
+                images.sagittal.forEach((img, i) => pushDataUrl(`${bundleName}/images/sagittal_${i + 1}.jpg`, img));
+                images.threeD.forEach((img, i) => pushDataUrl(`${bundleName}/images/3d_${i + 1}.jpg`, img));
+            }
+
+            const success = await window.electron.writeBundle(dir, files);
+            if (!success) {
+                throw new Error('Bundle writing failed');
+            }
+        } catch (e) {
+            console.error(e);
+            alert('Error exporting presentation pack');
         } finally {
             setGenerating(false);
         }
@@ -312,14 +395,30 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ volume, segmentati
                 </div>
             </div>
 
-            <div className="mt-auto">
+            <div className="mt-auto space-y-2">
                 <button
-                    onClick={handleGenerateReport}
+                    onClick={handleClinicalSummaryExport}
                     disabled={generating || stats.length === 0}
-                    className="w-full py-3 mb-4 bg-cyan-700 hover:bg-cyan-600 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg flex items-center justify-center gap-2 transition-all shadow-lg"
+                    className="w-full py-3 bg-cyan-700 hover:bg-cyan-600 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg flex items-center justify-center gap-2 transition-all shadow-lg"
                 >
                     <Download className={`w-4 h-4 ${generating ? 'animate-bounce' : ''}`} />
-                    {generating ? 'Compiling PDF...' : 'Generate Report'}
+                    {generating ? 'Compiling...' : 'Clinical Summary (PDF)'}
+                </button>
+                <button
+                    onClick={handleResearchMetricsExport}
+                    disabled={generating || stats.length === 0}
+                    className="w-full py-3 bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg flex items-center justify-center gap-2 transition-all shadow-lg"
+                >
+                    <Table2 className="w-4 h-4" />
+                    Research Metrics (CSV)
+                </button>
+                <button
+                    onClick={handlePresentationPackExport}
+                    disabled={generating || stats.length === 0}
+                    className="w-full py-3 bg-purple-700 hover:bg-purple-600 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg flex items-center justify-center gap-2 transition-all shadow-lg"
+                >
+                    <Presentation className="w-4 h-4" />
+                    {generating ? 'Bundling Files...' : 'Presentation Pack (Bundle)'}
                 </button>
             </div>
         </div>

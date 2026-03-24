@@ -20,6 +20,7 @@ interface ExternalModel {
     description: string;
     goal?: string;
     input_shape?: string | number[];
+    input_format?: string;
     output_classes?: string[];
 }
 
@@ -49,6 +50,8 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
     const [models, setModels] = useState<ExternalModel[]>([]);
     const [selectedModelId, setSelectedModelId] = useState<string>('');
     const [isFetchingModels, setIsFetchingModels] = useState(false);
+    const [modelsFetchStatus, setModelsFetchStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
+    const [modelsFetchMessage, setModelsFetchMessage] = useState('');
     
     // Initialize defaults when volume loads
     useEffect(() => {
@@ -556,7 +559,10 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
     const fetchModels = async () => {
         if (!serverUrl) return;
         setIsFetchingModels(true);
+        setModelsFetchStatus('loading');
+        setModelsFetchMessage('Loading available methods...');
         setModels([]);
+        setSelectedModelId('');
         try {
             // Remove trailing slash if present for robustness
             const baseUrl = serverUrl.replace(/\/$/, '');
@@ -568,20 +574,52 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
             
             const data = await response.json();
             if (Array.isArray(data) && data.length > 0) {
-                setModels(data);
-                setSelectedModelId(data[0].id);
+                const normalized: ExternalModel[] = data.map((item: any, idx: number) => ({
+                    id: String(item.id ?? item.method_id ?? idx),
+                    name: String(item.name ?? item.method_name ?? item.id ?? `Method ${idx + 1}`),
+                    description: String(item.description ?? 'No description provided.'),
+                    goal: item.goal ? String(item.goal) : undefined,
+                    input_shape: item.input_shape,
+                    input_format: item.input_format ? String(item.input_format) : undefined,
+                    output_classes: Array.isArray(item.output_classes) ? item.output_classes.map(String) : undefined
+                }));
+                setModels(normalized);
+                setSelectedModelId(normalized[0].id);
+                setModelsFetchStatus('success');
+                setModelsFetchMessage(`${normalized.length} method${normalized.length > 1 ? 's' : ''} loaded.`);
             } else if (Array.isArray(data) && data.length === 0) {
-                alert("Connected, but no models found on server.");
+                setModelsFetchStatus('error');
+                setModelsFetchMessage("Connected, but no methods were found.");
             } else {
                 throw new Error("Invalid response format. Expected JSON array.");
             }
         } catch (e: any) {
             console.error(e);
-            alert(`Connection failed: ${e.message}. Ensure CORS is enabled on the server.`);
+            setModelsFetchStatus('error');
+            setModelsFetchMessage(`Connection failed: ${e.message}`);
         } finally {
             setIsFetchingModels(false);
         }
     };
+
+    // Auto-fetch available methods whenever endpoint changes (debounced)
+    useEffect(() => {
+        if (mode !== ToolCategory.Segmentation) return;
+        const trimmed = serverUrl.trim();
+        if (!trimmed) {
+            setModels([]);
+            setSelectedModelId('');
+            setModelsFetchStatus('idle');
+            setModelsFetchMessage('');
+            return;
+        }
+
+        const timeout = setTimeout(() => {
+            fetchModels();
+        }, 600);
+
+        return () => clearTimeout(timeout);
+    }, [serverUrl, mode]);
 
     const runBackendSegmentation = async () => {
         if (!volume || !onUpdateSegmentation || !selectedModelId) return;
@@ -996,23 +1034,41 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
                                 </button>
                             </div>
 
+                            {modelsFetchStatus !== 'idle' && (
+                                <div className={`text-[10px] px-2 py-1 rounded border ${modelsFetchStatus === 'success'
+                                    ? 'text-green-300 border-green-800/70 bg-green-900/20'
+                                    : modelsFetchStatus === 'error'
+                                        ? 'text-red-300 border-red-800/70 bg-red-900/20'
+                                        : 'text-cyan-300 border-cyan-800/70 bg-cyan-900/20'
+                                    }`}>
+                                    {modelsFetchMessage}
+                                </div>
+                            )}
+
                             {models.length > 0 && (
                                 <div className="space-y-2 animate-in fade-in slide-in-from-top-2">
-                                    <div className="relative">
-                                        <select 
-                                            value={selectedModelId}
-                                            onChange={(e) => setSelectedModelId(e.target.value)}
-                                            className="w-full bg-gray-800 border border-gray-700 text-gray-200 text-xs rounded p-2 appearance-none focus:ring-1 focus:ring-purple-500 focus:border-purple-500 outline-none pr-8"
-                                        >
-                                            {models.map(m => (
-                                                <option key={m.id} value={m.id}>{m.name}</option>
-                                            ))}
-                                        </select>
-                                        <div className="absolute inset-y-0 right-0 flex items-center px-2 pointer-events-none text-gray-400">
-                                            <ChevronDown />
-                                        </div>
+                                    <div className="text-[10px] text-gray-400 uppercase tracking-wider">Available Methods</div>
+                                    <div className="max-h-44 overflow-y-auto space-y-2 pr-1">
+                                        {models.map((m) => (
+                                            <button
+                                                key={m.id}
+                                                onClick={() => setSelectedModelId(m.id)}
+                                                className={`w-full text-left p-2 rounded border transition-colors ${selectedModelId === m.id
+                                                    ? 'border-purple-500 bg-purple-900/30'
+                                                    : 'border-gray-700 bg-gray-800/50 hover:border-gray-500'
+                                                    }`}
+                                            >
+                                                <div className="text-xs text-gray-100 font-medium">{m.name}</div>
+                                                <div className="text-[10px] text-gray-400 mt-0.5">{m.description}</div>
+                                                {(m.input_format || m.input_shape) && (
+                                                    <div className="text-[10px] text-cyan-300 font-mono mt-1">
+                                                        Input: {m.input_format || (Array.isArray(m.input_shape) ? m.input_shape.join('x') : m.input_shape)}
+                                                    </div>
+                                                )}
+                                            </button>
+                                        ))}
                                     </div>
-                                    
+
                                     {selectedModel && (
                                         <div className="bg-gray-800/50 p-2 rounded border border-gray-700/50 text-[10px] space-y-1">
                                             <div className="flex gap-1.5 items-start">
@@ -1020,10 +1076,13 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
                                                 <span className="text-gray-300 italic">{selectedModel.description}</span>
                                             </div>
                                             {selectedModel.goal && (
-                                                <div className="text-gray-500 pl-4.5">Goal: {selectedModel.goal}</div>
+                                                <div className="text-gray-500">Goal: {selectedModel.goal}</div>
                                             )}
                                             {selectedModel.input_shape && (
-                                                <div className="text-gray-500 pl-4.5 font-mono">Input: {Array.isArray(selectedModel.input_shape) ? selectedModel.input_shape.join('x') : selectedModel.input_shape}</div>
+                                                <div className="text-gray-500 font-mono">Input shape: {Array.isArray(selectedModel.input_shape) ? selectedModel.input_shape.join('x') : selectedModel.input_shape}</div>
+                                            )}
+                                            {selectedModel.input_format && (
+                                                <div className="text-gray-500 font-mono">Input format: {selectedModel.input_format}</div>
                                             )}
                                         </div>
                                     )}
@@ -1032,11 +1091,11 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
 
                             <button 
                                 onClick={runBackendSegmentation}
-                                disabled={isProcessing || !volume || !selectedModelId}
+                                disabled={isProcessing || !volume || !selectedModelId || isFetchingModels || models.length === 0}
                                 className="w-full py-2 bg-purple-900/40 border border-purple-800/50 hover:bg-purple-900/60 hover:border-purple-500 text-purple-300 text-xs rounded transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                             >
                                 {isProcessing ? <Loader2 className="animate-spin w-3 h-3"/> : <Cpu className="w-3 h-3" />}
-                                Run Inference
+                                {isFetchingModels ? 'Loading Methods...' : 'Run Inference'}
                             </button>
                         </div>
                     </div>

@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, dialog, Menu, shell } from 'electron';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import Store from 'electron-store';
-import { readFile, writeFile } from 'fs/promises';
+import { mkdir, readFile, writeFile } from 'fs/promises';
 
 // ES module __dirname equivalent
 const __filename = fileURLToPath(import.meta.url);
@@ -189,7 +189,7 @@ function createMenu() {
 // File Dialog - Open files (NIfTI/DICOM)
 ipcMain.handle('dialog:openFile', async (_, options?: {
     filters?: Electron.FileFilter[],
-    properties?: ('openFile' | 'multiSelections')[]
+    properties?: ('openFile' | 'multiSelections' | 'openDirectory' | 'createDirectory')[]
 }) => {
     if (!mainWindow) return null;
 
@@ -242,6 +242,43 @@ ipcMain.handle('dialog:saveFile', async (_, data: ArrayBuffer, defaultName: stri
     } catch (error) {
         console.error('Error saving file:', error);
         return null;
+    }
+});
+
+// File Dialog - Select output directory
+ipcMain.handle('dialog:selectDirectory', async () => {
+    if (!mainWindow) return null;
+
+    const result = await dialog.showOpenDialog(mainWindow, {
+        properties: ['openDirectory', 'createDirectory']
+    });
+
+    if (result.canceled || result.filePaths.length === 0) return null;
+    return result.filePaths[0];
+});
+
+// Write multiple text/base64 files to a directory
+ipcMain.handle('fs:writeBundle', async (_, directoryPath: string, files: Array<{
+    relativePath: string;
+    content: string;
+    encoding?: 'utf8' | 'base64';
+}>) => {
+    try {
+        await mkdir(directoryPath, { recursive: true });
+
+        for (const file of files) {
+            const fullPath = join(directoryPath, file.relativePath);
+            const parent = dirname(fullPath);
+            await mkdir(parent, { recursive: true });
+            await writeFile(fullPath, file.content, {
+                encoding: file.encoding || 'utf8'
+            });
+        }
+
+        return true;
+    } catch (error) {
+        console.error('Error writing bundle:', error);
+        return false;
     }
 });
 

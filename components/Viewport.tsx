@@ -47,6 +47,12 @@ interface Volume3DViewerProps {
     crosshair: { x: number, y: number, z: number };
 }
 
+interface RenderSettings {
+    mode: 0 | 1 | 2;
+    threshold: number;
+    opacity: number;
+}
+
 // --- CONSTANTS & HELPERS ---
 
 const SEG_PALETTE = [
@@ -363,7 +369,8 @@ void main() {
         float rawVal = texture(u_volume, texCoord).r;
         
         // Normalize on the fly
-        float val = (rawVal - u_dataRange.x) / (u_dataRange.y - u_dataRange.x);
+        float rangeDen = max(u_dataRange.y - u_dataRange.x, 1e-6);
+        float val = (rawVal - u_dataRange.x) / rangeDen;
         
         float seg = 0.0;
         if (u_hasSeg) seg = texture(u_segmentation, texCoord).r;
@@ -518,23 +525,30 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
     const containerRef = useRef<HTMLDivElement>(null);
     
     // View State
-    const [rotation, setRotation] = useState({ az: 45, el: 20 });
-    const [zoom, setZoom] = useState(1.0);
-    const [pan, setPan] = useState({ x: 0, y: 0 });
+    const [rotationUi, setRotationUi] = useState({ az: 45, el: 20 });
+    const [zoomUi, setZoomUi] = useState(1.0);
+    const [panUi, setPanUi] = useState({ x: 0, y: 0 });
     const [autoRotate, setAutoRotate] = useState(false);
+    const rotationRef = useRef({ az: 45, el: 20 });
+    const zoomRef = useRef(1.0);
+    const panRef = useRef({ x: 0, y: 0 });
+    const autoRotateRef = useRef(false);
     const [isFullscreen, setIsFullscreen] = useState(false);
     const [showSettings, setShowSettings] = useState(false);
     
     // Interaction State
     const isInteracting = useRef(false);
+    const [isInteractingUi, setIsInteractingUi] = useState(false);
     const interactionTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     // Render Mode Settings
-    const [settings, setSettings] = useState({
+    const [settings, setSettings] = useState<RenderSettings>({
         mode: 0 as 0 | 1 | 2, 
         threshold: 40,
         opacity: 0.8
     });
+    const settingsRef = useRef<RenderSettings>({ mode: 0, threshold: 40, opacity: 0.8 });
+    const [windowing, setWindowing] = useState({ p10: 40, p35: 100, p60: 150 });
 
     const isDraggingRef = useRef(false);
     const dragTypeRef = useRef<'rotate' | 'pan'>('rotate');
@@ -545,6 +559,17 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
     const volTexRef = useRef<WebGLTexture | null>(null);
     const segTexRef = useRef<WebGLTexture | null>(null);
     const vaoRef = useRef<WebGLVertexArrayObject | null>(null);
+
+    const syncUiFromRefs = useCallback(() => {
+        setRotationUi({ ...rotationRef.current });
+        setZoomUi(zoomRef.current);
+        setPanUi({ ...panRef.current });
+    }, []);
+
+    const updateSettings = useCallback((next: RenderSettings) => {
+        settingsRef.current = next;
+        setSettings(next);
+    }, []);
 
     // Initialize WebGL
     useEffect(() => {
@@ -579,12 +604,40 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
         vaoRef.current = vao;
     }, []);
 
+    useEffect(() => {
+        autoRotateRef.current = autoRotate;
+    }, [autoRotate]);
+
     // Load Textures
     useEffect(() => {
         const gl = glRef.current;
         if (!gl || !volume) return;
         if (volTexRef.current) gl.deleteTexture(volTexRef.current);
         volTexRef.current = create3DTexture(gl, volume, false);
+
+        // Fast approximate percentiles using downsampled intensity values.
+        const sample: number[] = [];
+        const volData = volume.data;
+        const stride = Math.max(1, Math.floor(volData.length / 20000));
+        for (let i = 0; i < volData.length; i += stride) {
+            sample.push(Number(volData[i]));
+        }
+        sample.sort((a, b) => a - b);
+        const at = (q: number) => sample[Math.max(0, Math.min(sample.length - 1, Math.floor(q * (sample.length - 1))))];
+        const p10Raw = at(0.1);
+        const p35Raw = at(0.35);
+        const p60Raw = at(0.6);
+        const range = Math.max(volume.max - volume.min, 1e-6);
+        const toThreshold = (val: number) => Math.round(Math.max(0, Math.min(255, ((val - volume.min) / range) * 255)));
+        const nextWindowing = {
+            p10: toThreshold(p10Raw),
+            p35: toThreshold(p35Raw),
+            p60: toThreshold(p60Raw)
+        };
+        setWindowing(nextWindowing);
+        const mode = settingsRef.current.mode;
+        const defaultThreshold = mode === 1 ? nextWindowing.p60 : mode === 2 ? nextWindowing.p35 : nextWindowing.p10;
+        updateSettings({ ...settingsRef.current, threshold: defaultThreshold });
     }, [volume]);
 
     useEffect(() => {
@@ -593,11 +646,13 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
         if (segTexRef.current) { gl.deleteTexture(segTexRef.current); segTexRef.current = null; }
         if (segmentation) {
             segTexRef.current = create3DTexture(gl, segmentation, true);
-            setSettings(s => ({ ...s, mode: 2 })); // Auto-switch to surface mode
+            const next = { ...settingsRef.current, mode: 2 as const, threshold: windowing.p35 };
+            updateSettings(next); // Auto-switch to surface mode
         } else {
-            setSettings(s => ({ ...s, mode: 0 })); // Back to volume
+            const next = { ...settingsRef.current, mode: 0 as const, threshold: windowing.p10 };
+            updateSettings(next); // Back to volume
         }
-    }, [segmentation]);
+    }, [segmentation, updateSettings, windowing.p10, windowing.p35]);
 
     // Render Loop
     useEffect(() => {
@@ -610,15 +665,15 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
 
         let rAF: number;
         const render = () => {
-            if (autoRotate && !isDraggingRef.current) {
-                setRotation(r => ({ ...r, az: (r.az + 0.5) % 360 }));
+            if (autoRotateRef.current && !isDraggingRef.current) {
+                rotationRef.current.az = (rotationRef.current.az + 0.5) % 360;
             }
 
             const w = container.clientWidth;
             const h = container.clientHeight;
             
             // Dynamic Resolution
-            const pixelRatio = (isInteracting.current || autoRotate) ? 0.75 : window.devicePixelRatio;
+            const pixelRatio = (isInteracting.current || autoRotateRef.current) ? 0.75 : Math.min(window.devicePixelRatio, 1.5);
             const targetW = Math.floor(w * pixelRatio);
             const targetH = Math.floor(h * pixelRatio);
 
@@ -660,8 +715,8 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
             
             const boxSize = [physX / maxDim, physY / maxDim, physZ / maxDim];
 
-            const radAz = rotation.az * Math.PI / 180;
-            const radEl = rotation.el * Math.PI / 180;
+            const radAz = rotationRef.current.az * Math.PI / 180;
+            const radEl = rotationRef.current.el * Math.PI / 180;
             const r = 2.0;
             const cx = r * Math.sin(radAz) * Math.cos(radEl);
             const cy = r * Math.sin(radEl);
@@ -678,14 +733,15 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
             gl.uniform3f(gl.getUniformLocation(prog, 'u_dims'), dimX, dimY, dimZ);
             gl.uniform3f(gl.getUniformLocation(prog, 'u_boxSize'), boxSize[0], boxSize[1], boxSize[2]);
             gl.uniform2f(gl.getUniformLocation(prog, 'u_dataRange'), volume.min, volume.max);
-            gl.uniform1f(gl.getUniformLocation(prog, 'u_zoom'), zoom);
-            gl.uniform2f(gl.getUniformLocation(prog, 'u_pan'), pan.x, pan.y);
-            gl.uniform1f(gl.getUniformLocation(prog, 'u_opacity'), settings.opacity);
-            gl.uniform1f(gl.getUniformLocation(prog, 'u_threshold'), settings.threshold);
-            gl.uniform1i(gl.getUniformLocation(prog, 'u_mode'), settings.mode);
+            gl.uniform1f(gl.getUniformLocation(prog, 'u_zoom'), zoomRef.current);
+            gl.uniform2f(gl.getUniformLocation(prog, 'u_pan'), panRef.current.x, panRef.current.y);
+            gl.uniform1f(gl.getUniformLocation(prog, 'u_opacity'), settingsRef.current.opacity);
+            gl.uniform1f(gl.getUniformLocation(prog, 'u_threshold'), settingsRef.current.threshold);
+            gl.uniform1i(gl.getUniformLocation(prog, 'u_mode'), settingsRef.current.mode);
             gl.uniform3f(gl.getUniformLocation(prog, 'u_lightDir'), -f[0], -f[1], -f[2]);
             
-            const stepSize = (isInteracting.current || autoRotate) ? 0.015 : 0.003;
+            const qualityBase = settingsRef.current.mode === 2 ? 0.0025 : 0.003;
+            const stepSize = (isInteracting.current || autoRotateRef.current) ? 0.015 : qualityBase;
             gl.uniform1f(gl.getUniformLocation(prog, 'u_stepSize'), stepSize);
 
             gl.bindVertexArray(vao);
@@ -696,13 +752,14 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
         render();
         return () => cancelAnimationFrame(rAF);
 
-    }, [volume, segmentation, rotation, zoom, pan, settings, autoRotate]);
+    }, [volume, segmentation]);
 
     const normalize = (v: number[]) => { const l = Math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]); return [v[0]/l, v[1]/l, v[2]/l]; };
     const cross = (a: number[], b: number[]) => [a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0]];
 
     const startInteraction = () => {
         isInteracting.current = true;
+        setIsInteractingUi(true);
         if (interactionTimeout.current) clearTimeout(interactionTimeout.current);
     };
 
@@ -710,6 +767,8 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
         if (interactionTimeout.current) clearTimeout(interactionTimeout.current);
         interactionTimeout.current = setTimeout(() => {
             isInteracting.current = false;
+            setIsInteractingUi(false);
+            syncUiFromRefs();
         }, 300);
     };
 
@@ -717,7 +776,7 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
         isDraggingRef.current = true; 
         lastMouseRef.current = { x: e.clientX, y: e.clientY };
         
-        if (e.button === 2 || e.shiftKey) {
+        if (e.button === 2 || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey || e.code === 'Space') {
             dragTypeRef.current = 'pan';
         } else {
             dragTypeRef.current = 'rotate';
@@ -734,16 +793,14 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
         lastMouseRef.current = { x: e.clientX, y: e.clientY };
 
         if (dragTypeRef.current === 'rotate') {
-            setRotation(r => ({ 
-                az: r.az + dx * 0.5, 
-                el: Math.max(-89, Math.min(89, r.el - dy * 0.5)) 
-            }));
+            rotationRef.current.az = rotationRef.current.az + dx * 0.5;
+            rotationRef.current.el = Math.max(-89, Math.min(89, rotationRef.current.el - dy * 0.5));
         } else {
-            const scale = 0.002 / zoom;
-            setPan(p => ({
-                x: p.x - dx * scale,
-                y: p.y + dy * scale
-            }));
+            const scale = 0.002 / zoomRef.current;
+            panRef.current = {
+                x: panRef.current.x - dx * scale,
+                y: panRef.current.y + dy * scale
+            };
         }
     };
 
@@ -753,8 +810,9 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
     };
 
     const handleWheel = (e: React.WheelEvent) => { 
+        e.preventDefault();
         startInteraction();
-        setZoom(prev => Math.max(0.1, Math.min(8.0, prev - Math.sign(e.deltaY) * 0.15)));
+        zoomRef.current = Math.max(0.1, Math.min(8.0, zoomRef.current - Math.sign(e.deltaY) * 0.15));
         endInteraction();
     };
 
@@ -765,13 +823,15 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
     };
 
     const resetView = () => {
-        setRotation({ az: 45, el: 20 });
-        setZoom(1.0);
-        setPan({ x: 0, y: 0 });
+        rotationRef.current = { az: 45, el: 20 };
+        zoomRef.current = 1.0;
+        panRef.current = { x: 0, y: 0 };
+        syncUiFromRefs();
     };
 
     const setPresetView = (az: number, el: number) => {
-        setRotation({ az, el });
+        rotationRef.current = { az, el };
+        syncUiFromRefs();
     };
 
     return (
@@ -783,14 +843,14 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
             onMouseLeave={handleMouseUp} 
             onWheel={handleWheel} 
             onContextMenu={(e) => e.preventDefault()}
-            className={`relative h-full w-full bg-black border-2 border-gray-800 overflow-hidden group ${isInteracting.current ? 'cursor-grabbing' : 'cursor-grab'}`}
+            className={`relative h-full w-full bg-black border-2 border-gray-800 overflow-hidden group ${isInteractingUi ? 'cursor-grabbing' : 'cursor-grab'}`}
         >
              <div className="absolute top-2 left-2 pointer-events-none flex flex-col gap-1 z-10">
                  <div className="text-xs font-mono text-cyan-400 bg-black/60 px-2 py-1 rounded">
-                     3D Render: {settings.mode === 2 ? 'Segmentation Surface' : 'Volumetric'}
+                     3D Render: {settings.mode === 2 ? 'Segmentation Surface' : settings.mode === 1 ? 'MIP' : 'Volumetric'}
                  </div>
                  <div className="text-[10px] text-gray-400 bg-black/40 px-2 py-0.5 rounded backdrop-blur-sm">
-                     L-Click: Rotate | R-Click: Pan
+                     Drag: Rotate | Shift/Ctrl/Right-Drag: Pan | Wheel: Zoom
                  </div>
              </div>
              
@@ -821,7 +881,15 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
                         <div className="space-y-3">
                             <div>
                                 <label className="block text-gray-400 mb-1">Mode</label>
-                                <select value={settings.mode} onChange={(e) => setSettings({...settings, mode: Number(e.target.value) as any})} className="w-full bg-gray-800 border border-gray-600 rounded p-1">
+                                <select
+                                    value={settings.mode}
+                                    onChange={(e) => {
+                                        const mode = Number(e.target.value) as 0 | 1 | 2;
+                                        const threshold = mode === 1 ? windowing.p60 : mode === 2 ? windowing.p35 : windowing.p10;
+                                        updateSettings({ ...settings, mode, threshold });
+                                    }}
+                                    className="w-full bg-gray-800 border border-gray-600 rounded p-1"
+                                >
                                     <option value={0}>Volumetric (Cloud)</option>
                                     <option value={1}>MIP (Max Intensity)</option>
                                     <option value={2}>Surface (Segmentation)</option>
@@ -831,23 +899,27 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
                                 <label className="flex justify-between text-gray-400 mb-1">
                                     Opacity <span className="text-cyan-400">{Math.round(settings.opacity * 100)}%</span>
                                 </label>
-                                <input type="range" min="0.05" max="1" step="0.05" value={settings.opacity} onChange={(e) => setSettings({...settings, opacity: Number(e.target.value)})} className="w-full h-1 bg-gray-700 rounded appearance-none accent-cyan-500" />
+                                <input type="range" min="0.05" max="1" step="0.05" value={settings.opacity} onChange={(e) => updateSettings({...settings, opacity: Number(e.target.value)})} className="w-full h-1 bg-gray-700 rounded appearance-none accent-cyan-500" />
                             </div>
                             <div>
                                 <label className="flex justify-between text-gray-400 mb-1">
                                     Threshold <span className="text-cyan-400">{settings.threshold}</span>
                                 </label>
-                                <input type="range" min="0" max="255" step="1" value={settings.threshold} onChange={(e) => setSettings({...settings, threshold: Number(e.target.value)})} className="w-full h-1 bg-gray-700 rounded appearance-none accent-cyan-500" />
+                                <input type="range" min="0" max="255" step="1" value={settings.threshold} onChange={(e) => updateSettings({...settings, threshold: Number(e.target.value)})} className="w-full h-1 bg-gray-700 rounded appearance-none accent-cyan-500" />
                             </div>
                             <div className="pt-2 border-t border-gray-700 flex flex-col gap-1">
                                 <label className="flex items-center gap-2 cursor-pointer">
-                                    <input type="checkbox" checked={autoRotate} onChange={(e) => setAutoRotate(e.target.checked)} className="rounded bg-gray-700 border-gray-600 text-cyan-500 focus:ring-0" />
+                    <input type="checkbox" checked={autoRotate} onChange={(e) => setAutoRotate(e.target.checked)} className="rounded bg-gray-700 border-gray-600 text-cyan-500 focus:ring-0" />
                                     <span>Auto Rotate</span>
                                 </label>
                             </div>
                         </div>
                      </div>
                  )}
+             </div>
+
+             <div className="absolute bottom-2 right-2 text-[10px] font-mono text-gray-400 bg-black/50 px-2 py-1 rounded z-20">
+                AZ {Math.round(rotationUi.az)} / EL {Math.round(rotationUi.el)} | Z {zoomUi.toFixed(2)}
              </div>
 
              <canvas ref={(ref as React.RefObject<HTMLCanvasElement>) || internalCanvasRef} className="block w-full h-full" />

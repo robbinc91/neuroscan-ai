@@ -4,7 +4,7 @@ export interface ElectronAPI {
     // File operations
     openFileDialog: (options?: {
         filters?: { name: string; extensions: string[] }[],
-        properties?: ('openFile' | 'multiSelections')[]
+        properties?: ('openFile' | 'multiSelections' | 'openDirectory' | 'createDirectory')[]
     }) => Promise<Array<{ name: string; path: string; data: ArrayBuffer }> | null>;
 
     saveFile: (
@@ -12,6 +12,15 @@ export interface ElectronAPI {
         defaultName: string,
         filters?: { name: string; extensions: string[] }[]
     ) => Promise<string | null>;
+    selectDirectory: () => Promise<string | null>;
+    writeBundle: (
+        directoryPath: string,
+        files: Array<{
+            relativePath: string;
+            content: string;
+            encoding?: 'utf8' | 'base64';
+        }>
+    ) => Promise<boolean>;
 
     // Settings store (encrypted)
     store: {
