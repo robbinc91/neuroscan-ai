@@ -75,13 +75,28 @@ Used when user clicks **Run Inference**.
 - `file`: binary blob named `volume.raw`
 - `dimensions`: JSON stringified array, e.g. `"[256,256,160]"`
 - `model_id`: selected model ID from `/models`
+- `geometry` (recommended): JSON string describing patient-space placement of the voxel grid (see below). The app sends this whenever geometry is known (NIfTI qform/sform, or DICOM IOP/IPP reconstruction).
+
+#### `geometry` JSON shape
+
+```json
+{
+  "dimensions": [256, 256, 160],
+  "affine_row_major": [m0, ..., m15],
+  "space": "LPS | RAS | SCANNER_ANAT | MNI_152 | UNKNOWN",
+  "notes": "optional free-text provenance"
+}
+```
+
+- `affine_row_major` is a **4×4 row-major** matrix mapping **voxel index column** \([i, j, k, 1]^T\) (i = fastest dimension) to homogeneous patient/world mm, consistent with NIfTI sform/qform layout used by `nifti-reader-js`. Voxel **centers** in the client use \((i+0.5, j+0.5, k+0.5)\) when resampling or comparing volumes.
+- For DICOM-derived volumes, `space` is **`LPS`** (DICOM patient coordinates). NIfTI files use the reader’s qform/sform codes to set `space` heuristically (`MNI_152`, `SCANNER_ANAT`, `RAS`, or `UNKNOWN`).
 
 #### Important input notes
 
 - `file` is raw voxel buffer from the current loaded volume (`volume.data.buffer`).
 - Voxel numeric type may vary in frontend (`Float32Array`, `Int16Array`, etc.).
 - Backend should define strict conversion policy (recommended: convert to `float32` internally).
-- No affine/header is sent in this request; only data buffer + dimensions.
+- Backends that ignore `geometry` still receive `dimensions` + raw buffer (legacy behavior). For neuroscience-grade inference, backends **should** parse `geometry.affine_row_major` to interpret left/right, mm spacing, and oblique slices; optionally resample internally to the model’s canonical grid.
 
 #### Response expected by app
 

@@ -521,7 +521,17 @@ const SliceViewer: React.FC<SliceViewerProps> = ({
 };
 
 const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerProps>(({ volume, segmentation, crosshair }, ref) => {
-    const internalCanvasRef = useRef<HTMLCanvasElement>(null);
+    const canvasRef = useRef<HTMLCanvasElement | null>(null);
+    const setCanvasRef = useCallback(
+        (el: HTMLCanvasElement | null) => {
+            canvasRef.current = el;
+            if (typeof ref === 'function') (ref as (node: HTMLCanvasElement | null) => void)(el);
+            else if (ref && typeof ref === 'object' && 'current' in ref) {
+                (ref as React.MutableRefObject<HTMLCanvasElement | null>).current = el;
+            }
+        },
+        [ref]
+    );
     const containerRef = useRef<HTMLDivElement>(null);
     
     // View State
@@ -551,8 +561,9 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
     const [windowing, setWindowing] = useState({ p10: 40, p35: 100, p60: 150 });
 
     const isDraggingRef = useRef(false);
-    const dragTypeRef = useRef<'rotate' | 'pan'>('rotate');
+    const dragTypeRef = useRef<'rotate' | 'pan' | 'zoom'>('rotate');
     const lastMouseRef = useRef({ x: 0, y: 0 });
+    const dragCleanupRef = useRef<(() => void) | null>(null);
 
     const glRef = useRef<WebGL2RenderingContext | null>(null);
     const programRef = useRef<WebGLProgram | null>(null);
@@ -573,7 +584,7 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
 
     // Initialize WebGL
     useEffect(() => {
-        const canvas = (ref as React.RefObject<HTMLCanvasElement>)?.current || internalCanvasRef.current;
+        const canvas = canvasRef.current;
         if (!canvas) return;
         
         const gl = canvas.getContext('webgl2', { alpha: false, antialias: false, preserveDrawingBuffer: true });
@@ -772,49 +783,105 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
         }, 300);
     };
 
-    const handleMouseDown = (e: React.MouseEvent) => { 
-        isDraggingRef.current = true; 
-        lastMouseRef.current = { x: e.clientX, y: e.clientY };
-        
-        if (e.button === 2 || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey || e.code === 'Space') {
-            dragTypeRef.current = 'pan';
-        } else {
-            dragTypeRef.current = 'rotate';
-        }
-        startInteraction();
-    };
+    const [dragUi, setDragUi] = useState<'none' | 'rotate' | 'pan' | 'zoom'>('none');
 
-    const handleMouseMove = (e: React.MouseEvent) => {
-        if (!isDraggingRef.current) return;
-        startInteraction();
-        
-        const dx = e.clientX - lastMouseRef.current.x;
-        const dy = e.clientY - lastMouseRef.current.y;
-        lastMouseRef.current = { x: e.clientX, y: e.clientY };
+    const applyDragDelta = useCallback((dx: number, dy: number) => {
+        const w = Math.max(320, containerRef.current?.clientWidth ?? 800);
+        const rotSens = 280 / w;
+        const panScale = 0.0028 / Math.max(0.2, zoomRef.current);
 
         if (dragTypeRef.current === 'rotate') {
-            rotationRef.current.az = rotationRef.current.az + dx * 0.5;
-            rotationRef.current.el = Math.max(-89, Math.min(89, rotationRef.current.el - dy * 0.5));
-        } else {
-            const scale = 0.002 / zoomRef.current;
+            rotationRef.current.az += dx * rotSens;
+            rotationRef.current.el = Math.max(-89, Math.min(89, rotationRef.current.el - dy * rotSens * 0.92));
+        } else if (dragTypeRef.current === 'pan') {
             panRef.current = {
-                x: panRef.current.x - dx * scale,
-                y: panRef.current.y + dy * scale
+                x: panRef.current.x - dx * panScale,
+                y: panRef.current.y + dy * panScale
             };
+        } else if (dragTypeRef.current === 'zoom') {
+            zoomRef.current = Math.max(0.12, Math.min(16, zoomRef.current * Math.exp(-dy * 0.009)));
         }
+    }, []);
+
+    const detachWindowDrag = useRef<(() => void) | null>(null);
+
+    useEffect(() => {
+        return () => {
+            detachWindowDrag.current?.();
+        };
+    }, []);
+
+    const handleMouseDown = (e: React.MouseEvent) => {
+        if (e.button !== 0 && e.button !== 1 && e.button !== 2) return;
+
+        const target = e.target as HTMLElement;
+        if (target.closest('button, input, select, textarea, label')) return;
+
+        detachWindowDrag.current?.();
+
+        if (e.button === 1) {
+            e.preventDefault();
+            dragTypeRef.current = 'pan';
+            setDragUi('pan');
+        } else if (e.button === 2) {
+            e.preventDefault();
+            dragTypeRef.current = 'zoom';
+            setDragUi('zoom');
+        } else if (e.button === 0 && e.shiftKey) {
+            dragTypeRef.current = 'pan';
+            setDragUi('pan');
+        } else if (e.button === 0) {
+            dragTypeRef.current = 'rotate';
+            setDragUi('rotate');
+        }
+
+        isDraggingRef.current = true;
+        lastMouseRef.current = { x: e.clientX, y: e.clientY };
+        startInteraction();
+
+        const onWinMove = (ev: MouseEvent) => {
+            if (!isDraggingRef.current) return;
+            startInteraction();
+            const dx = ev.clientX - lastMouseRef.current.x;
+            const dy = ev.clientY - lastMouseRef.current.y;
+            lastMouseRef.current = { x: ev.clientX, y: ev.clientY };
+            applyDragDelta(dx, dy);
+        };
+
+        const onWinUp = () => {
+            window.removeEventListener('mousemove', onWinMove);
+            window.removeEventListener('mouseup', onWinUp);
+            detachWindowDrag.current = null;
+            isDraggingRef.current = false;
+            setDragUi('none');
+            endInteraction();
+        };
+
+        window.addEventListener('mousemove', onWinMove);
+        window.addEventListener('mouseup', onWinUp);
+        detachWindowDrag.current = () => {
+            window.removeEventListener('mousemove', onWinMove);
+            window.removeEventListener('mouseup', onWinUp);
+        };
     };
 
-    const handleMouseUp = () => { 
-        isDraggingRef.current = false; 
-        endInteraction(); 
-    };
-
-    const handleWheel = (e: React.WheelEvent) => { 
+    const handleWheel = (e: React.WheelEvent) => {
         e.preventDefault();
         startInteraction();
-        zoomRef.current = Math.max(0.1, Math.min(8.0, zoomRef.current - Math.sign(e.deltaY) * 0.15));
+        const dy = e.deltaY;
+        const step = (Math.min(Math.abs(dy), 80) / 80) * Math.sign(dy);
+        zoomRef.current = Math.max(0.12, Math.min(16, zoomRef.current * Math.exp(-step * 0.2)));
         endInteraction();
     };
+
+    const cursorClass =
+        dragUi === 'pan'
+            ? 'cursor-move'
+            : dragUi === 'zoom'
+              ? 'cursor-ns-resize'
+              : dragUi === 'rotate'
+                ? 'cursor-grabbing'
+                : 'cursor-grab';
 
     const toggleFullscreen = () => {
         if (!containerRef.current) return;
@@ -838,19 +905,16 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
         <div 
             ref={containerRef} 
             onMouseDown={handleMouseDown} 
-            onMouseMove={handleMouseMove} 
-            onMouseUp={handleMouseUp} 
-            onMouseLeave={handleMouseUp} 
             onWheel={handleWheel} 
             onContextMenu={(e) => e.preventDefault()}
-            className={`relative h-full w-full bg-black border-2 border-gray-800 overflow-hidden group ${isInteractingUi ? 'cursor-grabbing' : 'cursor-grab'}`}
+            className={`relative h-full w-full bg-black border-2 border-gray-800 overflow-hidden group select-none touch-none ${cursorClass}`}
         >
              <div className="absolute top-2 left-2 pointer-events-none flex flex-col gap-1 z-10">
                  <div className="text-xs font-mono text-cyan-400 bg-black/60 px-2 py-1 rounded">
                      3D Render: {settings.mode === 2 ? 'Segmentation Surface' : settings.mode === 1 ? 'MIP' : 'Volumetric'}
                  </div>
-                 <div className="text-[10px] text-gray-400 bg-black/40 px-2 py-0.5 rounded backdrop-blur-sm">
-                     Drag: Rotate | Shift/Ctrl/Right-Drag: Pan | Wheel: Zoom
+                 <div className="text-[10px] text-gray-400 bg-black/40 px-2 py-0.5 rounded backdrop-blur-sm max-w-[220px] leading-snug">
+                     Left: orbit · Middle or Shift+left: pan · Right drag: zoom · Wheel: zoom
                  </div>
              </div>
              
@@ -922,7 +986,7 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
                 AZ {Math.round(rotationUi.az)} / EL {Math.round(rotationUi.el)} | Z {zoomUi.toFixed(2)}
              </div>
 
-             <canvas ref={(ref as React.RefObject<HTMLCanvasElement>) || internalCanvasRef} className="block w-full h-full" />
+             <canvas ref={setCanvasRef} className="block w-full h-full pointer-events-none" />
         </div>
     );
 }));

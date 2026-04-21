@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { ProcessingMethod, ToolCategory, VolumeData, ViewportTool } from '../types';
 import { Play, RotateCcw, Save, Loader2, Check, Trash2, Sliders, Wand2, UploadCloud, CloudLightning, Server, RefreshCw, Info, Cpu, PenTool, Eraser, Hand, MousePointer2 } from 'lucide-react';
 import { parseNiftiFile } from '../utils/niftiUtils';
+import { volumeGeometryJson } from '../utils/volumeGeometry';
 
 interface ProcessingPanelProps {
     mode: ToolCategory;
@@ -542,7 +543,10 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
                 dimensions: [volume.dimensions[0], volume.dimensions[1], volume.dimensions[2]],
                 min: 0,
                 max: 255,
-                data: mask
+                data: mask,
+                affine: volume.affine ? [...volume.affine] : undefined,
+                coordSystem: volume.coordSystem,
+                geometryNotes: 'local_threshold_segmentation'
             };
 
             onUpdateSegmentation(segVol);
@@ -632,6 +636,7 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
             formData.append('file', blob, 'volume.raw');
             formData.append('dimensions', JSON.stringify(volume.dimensions));
             formData.append('model_id', selectedModelId);
+            formData.append('geometry', volumeGeometryJson(volume));
 
             setProgress(30);
 
@@ -657,6 +662,14 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
                     for(let i=0; i<len; i++) maskData[i] = segVol.data[i];
                     segVol.data = maskData;
                     segVol.header.datatypeCode = 2;
+                }
+
+                const d = volume.dimensions;
+                const sd = segVol.dimensions;
+                if (d[0] === sd[0] && d[1] === sd[1] && d[2] === sd[2] && volume.affine) {
+                    segVol.affine = [...volume.affine];
+                    segVol.coordSystem = volume.coordSystem;
+                    segVol.geometryNotes = `cloud_inference_output;aligned_to_input_volume;${segVol.geometryNotes || ''}`;
                 }
                 
                 onUpdateSegmentation(segVol);

@@ -9,7 +9,11 @@ import { ToolCategory, ViewMode, VolumeData, ViewportHandle, ViewportTool, Study
 import { Menu, Upload, User, Bell, Loader2, Layers, FolderInput, Settings } from 'lucide-react';
 import { parseNiftiFile } from './utils/niftiUtils';
 import { parseDicomFiles } from './utils/dicomUtils';
-import { computeVolumeDifference, computeSegmentationDifference } from './utils/imageProcessing';
+import {
+    computeVolumeDifferenceWithGeometry,
+    computeSegmentationDifference,
+    alignSegmentationToReferenceVolume
+} from './utils/imageProcessing';
 
 const App: React.FC = () => {
     const [activeTool, setActiveTool] = useState<ToolCategory>(ToolCategory.Viewer);
@@ -250,8 +254,14 @@ const App: React.FC = () => {
 
     const handleComputeDiff = () => {
         if (studies.length < 2) return;
-        const vDiff = computeVolumeDifference(studies[0].volume, studies[1].volume);
-        const sDiff = computeSegmentationDifference(studies[0].segmentation, studies[1].segmentation, studies[0].volume.dimensions);
+        const vDiff = computeVolumeDifferenceWithGeometry(studies[0].volume, studies[1].volume);
+        const segFollow = alignSegmentationToReferenceVolume(studies[1].segmentation, studies[0].volume);
+        if (studies[1].segmentation && !segFollow) {
+            alert(
+                'Follow-up segmentation could not be aligned to the baseline grid (missing geometry or resample failure). Segmentation difference was skipped.'
+            );
+        }
+        const sDiff = computeSegmentationDifference(studies[0].segmentation, segFollow, studies[0].volume);
 
         if (vDiff) setDiffVolume(vDiff);
         if (sDiff) setDiffSeg(sDiff);
