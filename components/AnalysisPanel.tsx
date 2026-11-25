@@ -1,12 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from 'recharts';
 import { FileText, Download, Presentation, FileJson, Table2 } from 'lucide-react';
-import { MOCK_METRICS } from '../constants';
 import { VolumeData, SegmentationStats, ReportImages } from '../types';
 import { jsPDF } from "jspdf";
 import html2canvas from "html2canvas";
 import { jpegDataUrlSize } from '../utils/reportImages';
 import { ensureVolumeMetadata, voxelSpacingMm } from '../utils/volumeMetadata';
+import { computeSegmentationStats } from '../utils/segmentationStats';
 
 let lastHandledExportId = 0;
 
@@ -232,55 +232,7 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ volume, segmentati
         }
 
         const timer = setTimeout(() => {
-            const segData = segmentation.data;
-            const volData = volume.data;
-            const len = segData.length;
-
-            const counts: Record<number, number> = {};
-            const sums: Record<number, number> = {};
-            const sqSums: Record<number, number> = {};
-
-            for (let i = 0; i < len; i++) {
-                const label = segData[i];
-                if (label > 0) {
-                    const val = volData[i];
-                    counts[label] = (counts[label] || 0) + 1;
-                    sums[label] = (sums[label] || 0) + val;
-                    sqSums[label] = (sqSums[label] || 0) + (val * val);
-                }
-            }
-
-            const [spacingX, spacingY, spacingZ] = voxelSpacingMm(volume);
-            const voxelVolMm3 = spacingX * spacingY * spacingZ;
-
-            const computedStats: SegmentationStats[] = Object.keys(counts).map(key => {
-                const labelId = Number(key);
-                const count = counts[labelId];
-                const sum = sums[labelId];
-                const sqSum = sqSums[labelId];
-
-                const mean = sum / count;
-                const variance = (sqSum / count) - (mean * mean);
-                const std = Math.sqrt(Math.max(0, variance));
-                const volumeCm3 = (count * voxelVolMm3) / 1000;
-
-                const name = labelMapping[String(labelId)] || `Label ${labelId}`;
-
-                return {
-                    label: name,
-                    volume: volumeCm3,
-                    intensityMean: mean,
-                    intensityStd: std
-                };
-            });
-
-            computedStats.sort((a, b) => {
-                const idA = parseInt(a.label.replace('Label ', '')) || 0;
-                const idB = parseInt(b.label.replace('Label ', '')) || 0;
-                return idA - idB;
-            });
-
-            setStats(computedStats);
+            setStats(computeSegmentationStats(volume, segmentation, labelMapping));
         }, 100);
 
         return () => clearTimeout(timer);

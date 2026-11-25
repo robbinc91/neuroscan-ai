@@ -184,6 +184,20 @@ function createMenu() {
                         mainWindow?.webContents.send('menu-export-report');
                     }
                 },
+                {
+                    label: 'Export Volume...',
+                    accelerator: 'CmdOrCtrl+Shift+S',
+                    click: () => {
+                        mainWindow?.webContents.send('menu-export-volume');
+                    }
+                },
+                {
+                    label: 'Export Segmentation...',
+                    accelerator: 'CmdOrCtrl+Shift+G',
+                    click: () => {
+                        mainWindow?.webContents.send('menu-export-segmentation');
+                    }
+                },
                 { type: 'separator' },
                 {
                     label: 'Settings',
@@ -407,6 +421,21 @@ ipcMain.handle('app:takePendingOpenFile', () => {
     const file = pendingOpenFile;
     pendingOpenFile = null;
     return file;
+});
+
+ipcMain.handle('fs:readFileByPath', async (_, filePath: string) => {
+    if (!filePath || typeof filePath !== 'string') return null;
+    try {
+        const buffer = await readFile(filePath);
+        return {
+            name: filePath.split(/[\\/]/).pop() || 'unknown',
+            path: filePath,
+            data: buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
+        };
+    } catch (error) {
+        console.error('readFileByPath failed:', error);
+        return null;
+    }
 });
 
 const gotInstanceLock = !app.isPackaged || app.requestSingleInstanceLock();

@@ -16,21 +16,7 @@ export enum ToolCategory {
     Comparison = 'COMPARISON'
 }
 
-export enum ProcessingMethod {
-    N4 = 'N4 Bias Correction',
-    HistogramMatching = 'Histogram Matching',
-    AnisotropicDiffusion = 'Anisotropic Diffusion',
-    NonLocalMeans = 'Non-local Means'
-}
-
 export type ViewportTool = 'crosshair' | 'pan' | 'zoom' | 'wl' | 'measure' | 'brush' | 'eraser';
-
-export interface MetricData {
-    name: string;
-    value: number;
-    unit: string;
-    reference?: string;
-}
 
 export interface ScanMetadata {
     id: string;
@@ -128,4 +114,5 @@ export interface ReportImages {
 
 export interface ViewportHandle {
     getReportImages: () => Promise<ReportImages>;
+    undoPaint: () => boolean;
 }

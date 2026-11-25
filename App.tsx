@@ -3,14 +3,25 @@ import { Sidebar } from './components/Sidebar';
 import { Viewport } from './components/Viewport';
 import { ProcessingPanel } from './components/ProcessingPanel';
 import { AnalysisPanel } from './components/AnalysisPanel';
+import { ReportingPanel } from './components/ReportingPanel';
 import { ComparisonPanel, ComparisonMode } from './components/ComparisonPanel';
 import { SettingsDialog } from './components/SettingsDialog';
 import { MetadataSidebar } from './components/MetadataSidebar';
 import { ToolCategory, ViewMode, VolumeData, ViewportHandle, ViewportTool, Study, WindowLevel } from './types';
-import { Menu, Loader2, Layers, FolderInput, Settings, LayoutGrid, Box, Info, FileText } from 'lucide-react';
+import { Menu, Loader2, Layers, FolderInput, Settings, LayoutGrid, Box, Info, FileText, History, Download } from 'lucide-react';
 import { parseNiftiFile } from './utils/niftiUtils';
 import { parseVolumeFromFile, parseVolumeFromFiles } from './utils/loadVolume';
 import { autoWindowLevel } from './utils/windowLevel';
+import { encodeNiftiGz } from './utils/niftiWrite';
+import {
+    loadSessionPrefs,
+    pushRecentFile,
+    saveConvention,
+    saveViewMode,
+    saveWindowLevel,
+    type RecentFile
+} from './utils/sessionStore';
+import type { DisplayConvention } from './utils/orientation';
 import { ensureVolumeMetadata, patientFooterLabel } from './utils/volumeMetadata';
 import {
     computeVolumeDifferenceWithGeometry,
@@ -47,7 +58,14 @@ const App: React.FC = () => {
     const [isLoading, setIsLoading] = useState(false);
     const [viewportTool, setViewportTool] = useState<ViewportTool>('crosshair');
     const [brushSize, setBrushSize] = useState(5);
+    const [brushLabel, setBrushLabel] = useState(1);
     const [windowLevel, setWindowLevel] = useState<WindowLevel | null>(null);
+    const [displayConvention, setDisplayConvention] = useState<DisplayConvention>('radiological');
+    const [cinePlaying, setCinePlaying] = useState(false);
+    const [recentFiles, setRecentFiles] = useState<RecentFile[]>([]);
+    const pendingWlRestoreRef = useRef<WindowLevel | null>(null);
+    const [sessionReady, setSessionReady] = useState(false);
+    const [paintUndoCount, setPaintUndoCount] = useState(0);
     const [menuOpen, setMenuOpen] = useState(false);
 
     // Shared Position for Sync
@@ -74,7 +92,13 @@ const App: React.FC = () => {
         setVolume(next);
         setVolumeHistory([]);
         setSegmentationVolume(null);
-        setWindowLevel(autoWindowLevel(next));
+        setWindowLevel(pendingWlRestoreRef.current ?? autoWindowLevel(next));
+        pendingWlRestoreRef.current = null;
+    };
+
+    const rememberRecent = (filePath?: string, name?: string) => {
+        if (!filePath) return;
+        void pushRecentFile(filePath, name || filePath.split(/[\\/]/).pop() || 'scan').then(setRecentFiles);
     };
 
     const commitVolume = (next: VolumeData) => {
@@ -144,6 +168,7 @@ const App: React.FC = () => {
 
             if (parsedVolume) {
                 loadVolume(parsedVolume, files[0].name);
+                rememberRecent(files[0].path, files[0].name);
             } else {
                 alert(`Failed to parse "${files[0].name}". Expected NIfTI (.nii, .nii.gz) or DICOM (.dcm, .ima).`);
             }
@@ -207,15 +232,16 @@ const App: React.FC = () => {
     };
 
     const lastOpenedKeyRef = useRef('');
-    const ingestOpenedFile = (file: { name: string; path: string; data: ArrayBuffer }) => {
+    const ingestOpenedFile = (file: { name: string; path: string; data: ArrayBuffer }, opts?: { force?: boolean }) => {
         const key = `${file.path}:${file.data.byteLength}`;
-        if (key === lastOpenedKeyRef.current) return;
+        if (!opts?.force && key === lastOpenedKeyRef.current) return;
         lastOpenedKeyRef.current = key;
         setIsLoading(true);
         try {
             const parsedVolume = parseVolumeFromFile(file.name, file.data);
             if (parsedVolume) {
                 loadVolume(parsedVolume, file.name);
+                rememberRecent(file.path, file.name);
             } else {
                 alert(`Failed to parse "${file.name}". Expected NIfTI (.nii, .nii.gz) or DICOM (.dcm, .ima).`);
             }
@@ -227,10 +253,52 @@ const App: React.FC = () => {
         }
     };
 
+    const exportNifti = async (kind: 'volume' | 'seg') => {
+        if (!window.electron) {
+            alert('Export is available in the desktop app.');
+            return;
+        }
+        const vol = kind === 'seg' ? segmentationRef.current : volumeRef.current;
+        if (!vol) {
+            alert(kind === 'seg' ? 'Load or paint a segmentation before exporting.' : 'Load a scan before exporting.');
+            return;
+        }
+        try {
+            const gz = await encodeNiftiGz(vol, { mask: kind === 'seg' });
+            const rawName = vol.metadata?.sourceName || volumeRef.current?.metadata?.sourceName || 'volume';
+            const base = rawName.replace(/\.(nii\.gz|nii|dcm|ima)$/i, '');
+            const defaultName = kind === 'seg' ? `${base}_seg.nii.gz` : `${base}_processed.nii.gz`;
+            await window.electron.saveFile(gz, defaultName, [{ name: 'NIfTI gzip', extensions: ['gz'] }]);
+        } catch (e) {
+            console.error(e);
+            alert(`Export failed: ${e instanceof Error ? e.message : 'Unknown error'}`);
+        }
+    };
+
+    const openRecent = async (item: RecentFile) => {
+        if (!window.electron) return;
+        setIsLoading(true);
+        try {
+            const file = await window.electron.readFileByPath(item.path);
+            if (!file) {
+                alert(`Could not open "${item.path}". It may have been moved or deleted.`);
+                return;
+            }
+            ingestOpenedFile(file, { force: true });
+        } catch (e) {
+            console.error(e);
+            alert(`Error opening "${item.name}": ${e instanceof Error ? e.message : 'Unknown error'}`);
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
     const requestReportExportRef = useRef(requestReportExport);
     requestReportExportRef.current = requestReportExport;
     const ingestOpenedFileRef = useRef(ingestOpenedFile);
     ingestOpenedFileRef.current = ingestOpenedFile;
+    const exportNiftiRef = useRef(exportNifti);
+    exportNiftiRef.current = exportNifti;
 
     // Electron menu event handlers
     useEffect(() => {
@@ -246,6 +314,14 @@ const App: React.FC = () => {
 
         const unsubscribeExportReport = window.electron.onMenuExportReport(() => {
             requestReportExportRef.current();
+        });
+
+        const unsubscribeExportVolume = window.electron.onMenuExportVolume(() => {
+            void exportNiftiRef.current('volume');
+        });
+
+        const unsubscribeExportSeg = window.electron.onMenuExportSegmentation(() => {
+            void exportNiftiRef.current('seg');
         });
 
         const unsubscribeOpenSettings = window.electron.onMenuOpenSettings(() => {
@@ -270,6 +346,8 @@ const App: React.FC = () => {
             unsubscribeImportScan();
             unsubscribeImportSeg();
             unsubscribeExportReport();
+            unsubscribeExportVolume();
+            unsubscribeExportSeg();
             unsubscribeOpenSettings();
             unsubscribeViewMode();
             unsubscribeFileOpened();
@@ -286,10 +364,31 @@ const App: React.FC = () => {
             if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'z' || e.key === 'Z')) {
                 if (e.shiftKey) return;
                 e.preventDefault();
+                if (viewportRef.current?.undoPaint()) return;
                 undoVolume();
                 return;
             }
             if (e.ctrlKey || e.metaKey || e.altKey) return;
+            if (e.key === 'p' || e.key === 'P') {
+                e.preventDefault();
+                setViewportTool('pan');
+                return;
+            }
+            if (e.key === 'z' || e.key === 'Z') {
+                e.preventDefault();
+                setViewportTool('zoom');
+                return;
+            }
+            if (e.key === 'b' || e.key === 'B') {
+                e.preventDefault();
+                setViewportTool('brush');
+                return;
+            }
+            if (e.key === 'e' || e.key === 'E') {
+                e.preventDefault();
+                setViewportTool('eraser');
+                return;
+            }
             if (e.key === 'm' || e.key === 'M' || e.key === 'r' || e.key === 'R') {
                 e.preventDefault();
                 setViewportTool((t) => (t === 'measure' ? 'crosshair' : 'measure'));
@@ -344,6 +443,41 @@ const App: React.FC = () => {
         };
     }, [menuOpen]);
 
+    useEffect(() => {
+        let cancelled = false;
+        void loadSessionPrefs().then((prefs) => {
+            if (cancelled) return;
+            if (prefs.viewMode && (Object.values(ViewMode) as string[]).includes(prefs.viewMode)) {
+                setViewMode(prefs.viewMode);
+            }
+            if (prefs.windowLevel) pendingWlRestoreRef.current = prefs.windowLevel;
+            if (prefs.convention) setDisplayConvention(prefs.convention);
+            setRecentFiles(prefs.recentFiles);
+            setSessionReady(true);
+        });
+        return () => { cancelled = true; };
+    }, []);
+
+    useEffect(() => {
+        if (!sessionReady) return;
+        void saveViewMode(viewMode);
+    }, [viewMode, sessionReady]);
+
+    useEffect(() => {
+        if (!sessionReady) return;
+        void saveConvention(displayConvention);
+    }, [displayConvention, sessionReady]);
+
+    useEffect(() => {
+        if (!sessionReady || !windowLevel) return;
+        const t = window.setTimeout(() => { void saveWindowLevel(windowLevel); }, 400);
+        return () => window.clearTimeout(t);
+    }, [windowLevel, sessionReady]);
+
+    useEffect(() => {
+        if (!volume && cinePlaying) setCinePlaying(false);
+    }, [volume, cinePlaying]);
+
     // Drag and drop support
     const [isDragging, setIsDragging] = useState(false);
 
@@ -384,6 +518,8 @@ const App: React.FC = () => {
 
                 if (parsedVolume) {
                     loadVolume(parsedVolume, files[0].name);
+                    const droppedPath = (files[0] as File & { path?: string }).path;
+                    rememberRecent(droppedPath, files[0].name);
                 } else {
                     alert(`Failed to parse "${files[0].name}". Expected NIfTI (.nii, .nii.gz) or DICOM (.dcm, .ima).`);
                 }
@@ -460,16 +596,28 @@ const App: React.FC = () => {
                         onSelectViewportTool={setViewportTool}
                         brushSize={brushSize}
                         onBrushSizeChange={setBrushSize}
+                        brushLabel={brushLabel}
+                        onBrushLabelChange={setBrushLabel}
+                        canUndoPaint={paintUndoCount > 0}
+                        onUndoPaint={() => { viewportRef.current?.undoPaint(); }}
                     />
                 );
             case ToolCategory.Analysis:
-            case ToolCategory.Reporting:
                 return (
                     <AnalysisPanel
                         volume={volume}
                         segmentation={segmentationVolume}
                         onGenerateReport={() => viewportRef.current?.getReportImages()}
                         exportRequestId={exportRequestId}
+                    />
+                );
+            case ToolCategory.Reporting:
+                return (
+                    <ReportingPanel
+                        volume={volume}
+                        segmentation={segmentationVolume}
+                        onGenerateReport={() => viewportRef.current?.getReportImages()}
+                        onOpenSettings={() => setSettingsOpen(true)}
                     />
                 );
             case ToolCategory.Comparison:
@@ -505,6 +653,13 @@ const App: React.FC = () => {
     const wlProps = {
         windowLevel: windowLevel ?? undefined,
         onWindowLevelChange: (wl: WindowLevel) => setWindowLevel(wl)
+    };
+
+    const viewExtras = {
+        displayConvention,
+        onDisplayConventionChange: setDisplayConvention,
+        cinePlaying,
+        onCinePlayingChange: setCinePlaying
     };
 
     const footerVolume = volume ?? studies[0]?.volume ?? null;
@@ -545,7 +700,7 @@ const App: React.FC = () => {
                         {menuOpen && (
                             <div
                                 role="menu"
-                                className="absolute left-0 top-full mt-1 w-56 rounded-lg border border-gray-700 bg-gray-900 py-1 shadow-xl z-50"
+                                className="absolute left-0 top-full mt-1 w-64 max-h-[min(80vh,36rem)] overflow-y-auto rounded-lg border border-gray-700 bg-gray-900 py-1 shadow-xl z-50"
                             >
                                 <button
                                     type="button"
@@ -579,6 +734,44 @@ const App: React.FC = () => {
                                     </span>
                                     <span className="font-mono text-[10px] text-gray-500">Ctrl+E</span>
                                 </button>
+                                <button
+                                    type="button"
+                                    role="menuitem"
+                                    className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-40"
+                                    disabled={!volume}
+                                    onClick={() => { closeMenu(); void exportNifti('volume'); }}
+                                >
+                                    <Download className="w-3.5 h-3.5 text-cyan-400" />
+                                    Export Volume (.nii.gz)
+                                </button>
+                                <button
+                                    type="button"
+                                    role="menuitem"
+                                    className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-40"
+                                    disabled={!segmentationVolume}
+                                    onClick={() => { closeMenu(); void exportNifti('seg'); }}
+                                >
+                                    <Download className="w-3.5 h-3.5 text-green-400" />
+                                    Export Segmentation (.nii.gz)
+                                </button>
+                                <div className="my-1 h-px bg-gray-800" />
+                                <div className="px-3 py-1 text-[10px] uppercase tracking-wider text-gray-500 flex items-center gap-1.5">
+                                    <History className="w-3 h-3" /> Recent
+                                </div>
+                                {recentFiles.length === 0 ? (
+                                    <div className="px-3 py-1.5 text-[11px] text-gray-600">No recent files</div>
+                                ) : recentFiles.map((item) => (
+                                    <button
+                                        key={item.path}
+                                        type="button"
+                                        role="menuitem"
+                                        title={item.path}
+                                        className="flex w-full items-center px-3 py-1.5 text-left text-xs text-gray-200 hover:bg-gray-800"
+                                        onClick={() => { closeMenu(); void openRecent(item); }}
+                                    >
+                                        <span className="truncate">{item.name}</span>
+                                    </button>
+                                ))}
                                 <div className="my-1 h-px bg-gray-800" />
                                 {LAYOUT_OPTIONS.map((opt) => (
                                     <button
@@ -693,6 +886,7 @@ const App: React.FC = () => {
                                             position={sharedPosition}
                                             onPositionChange={setSharedPosition}
                                             {...wlProps}
+                                            {...viewExtras}
                                         />
                                     </div>
                                 ) : (
@@ -713,6 +907,7 @@ const App: React.FC = () => {
                                                 position={sharedPosition}
                                                 onPositionChange={setSharedPosition}
                                                 {...wlProps}
+                                                {...viewExtras}
                                             />
                                         </div>
                                         {/* Right Viewport (Difference or Follow-up) */}
@@ -730,6 +925,7 @@ const App: React.FC = () => {
                                                 onPositionChange={setSharedPosition}
                                                 enableSliceKeys={false}
                                                 {...wlProps}
+                                                {...viewExtras}
                                             />
                                         </div>
                                     </div>
@@ -752,6 +948,7 @@ const App: React.FC = () => {
                                         position={sharedPosition}
                                         onPositionChange={setSharedPosition}
                                         {...wlProps}
+                                        {...viewExtras}
                                     />
                                 </div>
                             )
@@ -769,7 +966,10 @@ const App: React.FC = () => {
                                 onUpdateSegmentation={updateSegmentation}
                                 position={sharedPosition}
                                 onPositionChange={setSharedPosition}
+                                brushLabel={brushLabel}
+                                onPaintHistoryChange={setPaintUndoCount}
                                 {...wlProps}
+                                {...viewExtras}
                             />
                         )}
                     </div>
@@ -777,8 +977,8 @@ const App: React.FC = () => {
                     <div className="h-6 bg-gray-900 border-t border-gray-800 flex items-center justify-between px-4 text-[10px] text-gray-500 uppercase tracking-wider shrink-0 z-20">
                         <div>
                             {footerPatient} | {activeTool === ToolCategory.Comparison ? 'Comparison Mode' : 'Standard Viewer'} | Layout {viewMode.replace('_', '-')} (0–4)
-                            {viewportTool === 'measure' ? ' | Measure: drag · Shift axis-lock · Esc cancel · Delete last' : ' | Click crosshair · Right-drag W/L · Arrows/wheel slice · I metadata'}
-                            {activeTool === ToolCategory.Processing ? ' | Ctrl+Z undo processing' : ''}
+                            {viewportTool === 'measure' ? ' | Measure: drag · Shift axis-lock · Esc cancel · Delete last' : ' | Pan P · Zoom Z · W/L W · Space cine · I metadata'}
+                            {activeTool === ToolCategory.Processing || activeTool === ToolCategory.Segmentation ? ' | Ctrl+Z undo' : ''}
                         </div>
                         <div className="flex items-center gap-2">
                             {(volume || (activeTool === ToolCategory.Comparison && studies.length > 0)) && <span className="text-cyan-500">Scan Active</span>}

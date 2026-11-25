@@ -14,11 +14,17 @@ interface ProcessingPanelProps {
     onSelectViewportTool?: (tool: ViewportTool) => void;
     brushSize?: number;
     onBrushSizeChange?: (size: number) => void;
+    brushLabel?: number;
+    onBrushLabelChange?: (label: number) => void;
+    canUndoPaint?: boolean;
+    onUndoPaint?: () => void;
     canUndoVolume?: boolean;
     canResetVolume?: boolean;
     onUndoVolume?: () => void;
     onResetVolume?: () => void;
 }
+
+const LABEL_COLORS = ['#ef4444', '#22c55e', '#3b82f6', '#eab308', '#a855f7', '#ec4899', '#f97316', '#06b6d4', '#a3e635'];
 
 interface ExternalModel {
     id: string;
@@ -33,6 +39,7 @@ interface ExternalModel {
 export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({ 
     mode, volume, onUpdateSegmentation, onUpdateVolume,
     viewportTool, onSelectViewportTool, brushSize, onBrushSizeChange,
+    brushLabel = 1, onBrushLabelChange, canUndoPaint, onUndoPaint,
     canUndoVolume, canResetVolume, onUndoVolume, onResetVolume
 }) => {
     const [isProcessing, setIsProcessing] = useState(false);
@@ -72,15 +79,15 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
 
     // Reset params on method change
     useEffect(() => {
-        if (procMethod.includes('gamma')) setParam1(procMethod === 'gamma_bright' ? 0.6 : 1.5);
+        if (procMethod.includes('gamma')) { setParam1(procMethod === 'gamma_bright' ? 0.6 : 1.5); setParam2(0.5); }
         else if (procMethod === 'sigmoid') { setParam1(10); setParam2(0.5); }
-        else if (procMethod === 'clahe') setParam1(2.0); // Clip limit
-        else if (procMethod === 'gaussian') setParam1(1.0);
-        else if (procMethod === 'unsharp') setParam1(1.0);
-        else if (procMethod === 'median_3d') setParam1(1);
-        else if (procMethod === 'tv_denoise') setParam1(10); // Iterations
+        else if (procMethod === 'clahe') { setParam1(2.0); setParam2(8); }
+        else if (procMethod === 'gaussian') { setParam1(1.0); setParam2(0.5); }
+        else if (procMethod === 'unsharp') { setParam1(1.0); setParam2(1.0); }
+        else if (procMethod === 'median_3d') { setParam1(1); setParam2(0.5); }
+        else if (procMethod === 'tv_denoise') { setParam1(15); setParam2(0.15); }
         else if (procMethod === 'n4_bias') { setParam1(50); setParam2(8); }
-        else setParam1(1.0);
+        else { setParam1(1.0); setParam2(0.5); }
         setCompleted(false);
     }, [procMethod]);
 
@@ -332,20 +339,21 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
                             className="w-full bg-gray-800 border border-gray-700 text-gray-200 text-xs rounded p-2.5 appearance-none focus:ring-1 focus:ring-cyan-500 focus:border-cyan-500 outline-none"
                         >
                             <optgroup label="Enhancement">
-                                <option value="clahe">1. T1-Optimized CLAHE (Adaptive)</option>
-                                <option value="hist_match">2. Histogram Matching (Reference)</option>
-                                <option value="hist_eq">3. Global Histogram Equalization</option>
-                                <option value="gamma_bright">4. Gamma Correction (Brighten)</option>
-                                <option value="gamma_dark">5. Gamma Correction (Darken)</option>
-                                <option value="sigmoid">6. Sigmoid Contrast Stretch</option>
+                                <option value="clahe">CLAHE (tiled adaptive)</option>
+                                <option value="hist_match">Histogram Matching (Reference)</option>
+                                <option value="hist_eq">Global Histogram Equalization</option>
+                                <option value="gamma_bright">Gamma Correction (Brighten)</option>
+                                <option value="gamma_dark">Gamma Correction (Darken)</option>
+                                <option value="sigmoid">Sigmoid Contrast Stretch</option>
                             </optgroup>
                             <optgroup label="Filtering / Denoising">
-                                <option value="unsharp">8. Unsharp Masking (Sharpen Edges)</option>
-                                <option value="gaussian">10. Gaussian Smoothing (3D)</option>
-                                <option value="median_3d">11. 3D Median Filter</option>
+                                <option value="unsharp">Unsharp Masking (3D)</option>
+                                <option value="gaussian">Gaussian Smoothing (3D)</option>
+                                <option value="median_3d">3D Median Filter</option>
+                                <option value="tv_denoise">Total Variation Denoise (3D)</option>
                             </optgroup>
                             <optgroup label="Bias Field Correction">
-                                <option value="n4_bias">13. N4 Bias Field Correction</option>
+                                <option value="n4_bias">N4 Bias Field Correction</option>
                             </optgroup>
                         </select>
                          <div className="absolute inset-y-0 right-0 flex items-center px-2 pointer-events-none text-gray-400">
@@ -373,18 +381,35 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
                          )}
 
                          {procMethod === 'clahe' && (
-                            <div className="space-y-1">
-                                <label className="flex justify-between text-xs text-gray-400">
-                                    <span>Clip Limit</span>
-                                    <span className="font-mono">{param1.toFixed(1)}</span>
-                                </label>
-                                <input 
-                                    type="range" min="0.5" max="5.0" step="0.5"
-                                    value={param1}
-                                    onChange={(e) => setParam1(Number(e.target.value))}
-                                    className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
-                                />
-                            </div>
+                            <>
+                                <div className="space-y-1">
+                                    <label className="flex justify-between text-xs text-gray-400">
+                                        <span>Clip Limit</span>
+                                        <span className="font-mono">{param1.toFixed(1)}</span>
+                                    </label>
+                                    <input
+                                        type="range" min="0.5" max="5.0" step="0.5"
+                                        value={param1}
+                                        onChange={(e) => setParam1(Number(e.target.value))}
+                                        className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+                                    />
+                                </div>
+                                <div className="space-y-1">
+                                    <label className="flex justify-between text-xs text-gray-400">
+                                        <span>Tile grid</span>
+                                        <span className="font-mono">{Math.round(param2)}×{Math.round(param2)}</span>
+                                    </label>
+                                    <input
+                                        type="range" min="4" max="16" step="1"
+                                        value={param2}
+                                        onChange={(e) => setParam2(Number(e.target.value))}
+                                        className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+                                    />
+                                </div>
+                                <div className="text-[10px] text-gray-500 italic leading-snug">
+                                    Per-slice CLAHE: clipped histograms on a tile grid with bilinear LUT interpolation.
+                                </div>
+                            </>
                          )}
 
                          {procMethod === 'sigmoid' && (
@@ -417,18 +442,67 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
                          )}
 
                          {procMethod === 'unsharp' && (
-                            <div className="space-y-1">
-                                <label className="flex justify-between text-xs text-gray-400">
-                                    <span>Strength</span>
-                                    <span className="font-mono">{param1.toFixed(1)}</span>
-                                </label>
-                                <input 
-                                    type="range" min="0.1" max="5.0" step="0.1"
-                                    value={param1}
-                                    onChange={(e) => setParam1(Number(e.target.value))}
-                                    className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
-                                />
-                            </div>
+                            <>
+                                <div className="space-y-1">
+                                    <label className="flex justify-between text-xs text-gray-400">
+                                        <span>Strength</span>
+                                        <span className="font-mono">{param1.toFixed(1)}</span>
+                                    </label>
+                                    <input
+                                        type="range" min="0.1" max="5.0" step="0.1"
+                                        value={param1}
+                                        onChange={(e) => setParam1(Number(e.target.value))}
+                                        className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+                                    />
+                                </div>
+                                <div className="space-y-1">
+                                    <label className="flex justify-between text-xs text-gray-400">
+                                        <span>Blur σ (voxels)</span>
+                                        <span className="font-mono">{param2.toFixed(2)}</span>
+                                    </label>
+                                    <input
+                                        type="range" min="0.3" max="3.0" step="0.1"
+                                        value={param2}
+                                        onChange={(e) => setParam2(Number(e.target.value))}
+                                        className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+                                    />
+                                </div>
+                                <div className="text-[10px] text-gray-500 italic leading-snug">
+                                    3D unsharp: original + strength × (original − Gaussian³).
+                                </div>
+                            </>
+                         )}
+
+                         {procMethod === 'tv_denoise' && (
+                            <>
+                                <div className="space-y-1">
+                                    <label className="flex justify-between text-xs text-gray-400">
+                                        <span>Iterations</span>
+                                        <span className="font-mono">{Math.round(param1)}</span>
+                                    </label>
+                                    <input
+                                        type="range" min="5" max="40" step="1"
+                                        value={param1}
+                                        onChange={(e) => setParam1(Number(e.target.value))}
+                                        className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+                                    />
+                                </div>
+                                <div className="space-y-1">
+                                    <label className="flex justify-between text-xs text-gray-400">
+                                        <span>Data fidelity (λ)</span>
+                                        <span className="font-mono">{param2.toFixed(2)}</span>
+                                    </label>
+                                    <input
+                                        type="range" min="0.05" max="0.5" step="0.01"
+                                        value={param2}
+                                        onChange={(e) => setParam2(Number(e.target.value))}
+                                        className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+                                    />
+                                </div>
+                                <div className="text-[10px] text-gray-500 italic leading-snug">
+                                    3D Chambolle TV-L2. Higher λ keeps more detail; more iterations increase smoothing cost.
+                                </div>
+                            </>
                          )}
 
                          {procMethod === 'gaussian' && (
@@ -631,8 +705,8 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
                                 
                                 <div className="bg-gray-900 p-2 rounded border border-gray-700">
                                     <div className="flex justify-between text-[10px] text-gray-400 mb-1">
-                                        <span>Brush Size</span>
-                                        <span>{brushSize}px</span>
+                                        <span>Radius</span>
+                                        <span>{brushSize} voxels</span>
                                     </div>
                                     <input 
                                         type="range" min="1" max="50" 
@@ -641,9 +715,42 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
                                         className="w-full h-1 bg-gray-700 rounded cursor-pointer accent-cyan-500"
                                     />
                                 </div>
+                                <div className="bg-gray-900 p-2 rounded border border-gray-700 space-y-1.5">
+                                    <div className="flex justify-between text-[10px] text-gray-400">
+                                        <span>Label</span>
+                                        <span className="font-mono">{brushLabel}</span>
+                                    </div>
+                                    <div className="grid grid-cols-9 gap-1">
+                                        {LABEL_COLORS.map((color, i) => {
+                                            const n = i + 1;
+                                            const active = brushLabel === n;
+                                            return (
+                                                <button
+                                                    key={n}
+                                                    type="button"
+                                                    title={`Paint label ${n}`}
+                                                    onClick={() => onBrushLabelChange?.(n)}
+                                                    className={`h-6 rounded text-[10px] font-mono ${active ? 'ring-2 ring-white text-black' : 'text-white/90'}`}
+                                                    style={{ backgroundColor: color }}
+                                                >
+                                                    {n}
+                                                </button>
+                                            );
+                                        })}
+                                    </div>
+                                </div>
+                                <button
+                                    type="button"
+                                    onClick={onUndoPaint}
+                                    disabled={!canUndoPaint}
+                                    title="Undo last brush stroke (Ctrl+Z)"
+                                    className="w-full py-2 bg-gray-800 border border-gray-700 rounded text-xs text-gray-300 hover:text-cyan-300 disabled:text-gray-600 disabled:hover:text-gray-600 flex items-center justify-center gap-1"
+                                >
+                                    <RotateCcw className="w-3 h-3" /> Undo stroke
+                                </button>
                                 <div className="text-[10px] text-gray-400 italic flex items-start gap-1">
                                     <Hand className="w-3 h-3 shrink-0 mt-0.5" />
-                                    Draw directly on the slice viewports.
+                                    Sphere in voxel space. Ctrl+Z undoes the last stroke.
                                 </div>
                             </div>
                         ) : (

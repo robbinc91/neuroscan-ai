@@ -37,6 +37,9 @@ export interface ElectronAPI {
     onMenuImportScan: (callback: () => void) => () => void;
     onMenuImportSegmentation: (callback: () => void) => () => void;
     onMenuExportReport: (callback: () => void) => () => void;
+    onMenuExportVolume: (callback: () => void) => () => void;
+    onMenuExportSegmentation: (callback: () => void) => () => void;
+    readFileByPath: (filePath: string) => Promise<{ name: string; path: string; data: ArrayBuffer } | null>;
     onMenuOpenSettings: (callback: () => void) => () => void;
     onMenuSetViewMode: (callback: (mode: string) => void) => () => void;
 

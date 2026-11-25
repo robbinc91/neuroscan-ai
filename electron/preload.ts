@@ -64,6 +64,20 @@ const electronAPI = {
         return () => ipcRenderer.removeListener('menu-export-report', callback);
     },
 
+    onMenuExportVolume: (callback: () => void) => {
+        ipcRenderer.on('menu-export-volume', callback);
+        return () => ipcRenderer.removeListener('menu-export-volume', callback);
+    },
+
+    onMenuExportSegmentation: (callback: () => void) => {
+        ipcRenderer.on('menu-export-segmentation', callback);
+        return () => ipcRenderer.removeListener('menu-export-segmentation', callback);
+    },
+
+    readFileByPath: async (filePath: string) => {
+        return await ipcRenderer.invoke('fs:readFileByPath', filePath);
+    },
+
     onMenuOpenSettings: (callback: () => void) => {
         ipcRenderer.on('menu-open-settings', callback);
         return () => ipcRenderer.removeListener('menu-open-settings', callback);

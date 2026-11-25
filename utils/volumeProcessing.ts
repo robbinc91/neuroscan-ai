@@ -1,6 +1,6 @@
 import type { VolumeData } from '../types';
 import { correctN4BiasField } from './n4BiasCorrection';
-import { gaussianSmooth3D, medianFilter3D, localAdaptiveGaussianMask } from './volumeFilters';
+import { gaussianSmooth3D, medianFilter3D, localAdaptiveGaussianMask, claheVolume, tvDenoise3D } from './volumeFilters';
 
 export type ProcessMethodId =
     | 'hist_eq'
@@ -12,7 +12,8 @@ export type ProcessMethodId =
     | 'unsharp'
     | 'hist_match'
     | 'n4_bias'
-    | 'median_3d';
+    | 'median_3d'
+    | 'tv_denoise';
 
 export type SegmentMethodId =
     | 'binary'
@@ -114,6 +115,34 @@ export async function processVolumeData(input: VolumeProcessInput): Promise<Volu
         return withMinMax(filtered);
     }
 
+    if (method === 'clahe') {
+        const filtered = await claheVolume(data, dimensions, param1, param2, min, max, onProgress);
+        return withMinMax(filtered);
+    }
+
+    if (method === 'unsharp') {
+        const sigma = Math.max(0.3, param2 || 1);
+        const blurred = await gaussianSmooth3D(data, dimensions, sigma, async (pct) => {
+            await report(Math.floor(pct * 0.9));
+        });
+        const strength = param1;
+        const outSharp = new Float32Array(len);
+        const chunk = 500000;
+        for (let i = 0; i < len; i += chunk) {
+            const end = Math.min(i + chunk, len);
+            for (let j = i; j < end; j++) {
+                outSharp[j] = data[j] + strength * (data[j] - blurred[j]);
+            }
+        }
+        await report(100);
+        return withMinMax(outSharp);
+    }
+
+    if (method === 'tv_denoise') {
+        const filtered = await tvDenoise3D(data, dimensions, param2, param1, onProgress);
+        return withMinMax(filtered);
+    }
+
     const out = new Float32Array(len);
     out.set(data as ArrayLike<number>);
 
@@ -131,45 +160,6 @@ export async function processVolumeData(input: VolumeProcessInput): Promise<Volu
                 out[j] = min + (cdf[bin] / total) * range;
             }
             await report(Math.floor((end / len) * 100));
-        }
-        return withMinMax(out);
-    }
-
-    if (method === 'clahe') {
-        const clipLimit = param1;
-        const sliceLen = width * height;
-        for (let z = 0; z < depth; z++) {
-            const offset = z * sliceLen;
-            let sMin = Infinity, sMax = -Infinity;
-            for (let k = 0; k < sliceLen; k++) {
-                const v = data[offset + k];
-                if (v < sMin) sMin = v;
-                if (v > sMax) sMax = v;
-            }
-            const sRange = sMax - sMin || 1;
-            const hist = new Int32Array(256);
-            for (let k = 0; k < sliceLen; k++) {
-                const bin = Math.max(0, Math.min(255, Math.floor(((data[offset + k] - sMin) / sRange) * 255)));
-                hist[bin]++;
-            }
-            const limit = (sliceLen / 256) * clipLimit;
-            let excess = 0;
-            for (let k = 0; k < 256; k++) {
-                if (hist[k] > limit) {
-                    excess += hist[k] - limit;
-                    hist[k] = limit;
-                }
-            }
-            const increment = excess / 256;
-            for (let k = 0; k < 256; k++) hist[k] += increment;
-            const cdf = new Float32Array(256);
-            let sum = 0;
-            for (let k = 0; k < 256; k++) { sum += hist[k]; cdf[k] = sum / sliceLen; }
-            for (let k = 0; k < sliceLen; k++) {
-                const bin = Math.max(0, Math.min(255, Math.floor(((data[offset + k] - sMin) / sRange) * 255)));
-                out[offset + k] = sMin + cdf[bin] * sRange;
-            }
-            if (z % 4 === 0 || z === depth - 1) await report(Math.floor(((z + 1) / depth) * 100));
         }
         return withMinMax(out);
     }
@@ -197,23 +187,6 @@ export async function processVolumeData(input: VolumeProcessInput): Promise<Volu
             for (let j = i; j < end; j++) {
                 const u = (data[j] - min) / range;
                 out[j] = min + (1 / (1 + Math.exp(-gain * (u - cutoff)))) * range;
-            }
-            await report(Math.floor((end / len) * 100));
-        }
-        return withMinMax(out);
-    }
-
-    if (method === 'unsharp') {
-        const strength = param1;
-        const blurred = new Float32Array(len);
-        for (let i = width + 1; i < len - width - 1; i++) {
-            blurred[i] = (out[i - 1] + out[i] + out[i + 1] + out[i - width] + out[i + width]) / 5;
-        }
-        const chunk = 500000;
-        for (let i = 0; i < len; i += chunk) {
-            const end = Math.min(i + chunk, len);
-            for (let j = i; j < end; j++) {
-                out[j] = data[j] + strength * (data[j] - blurred[j]);
             }
             await report(Math.floor((end / len) * 100));
         }

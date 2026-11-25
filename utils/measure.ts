@@ -40,17 +40,23 @@ export function sliceUvToVoxel(
     u: number,
     v: number,
     slice: number,
-    dimensions: [number, number, number]
+    dimensions: [number, number, number],
+    flipH = false
 ): [number, number, number] {
     const [dx, dy, dz] = dimensions;
     const plane = displayedSliceIndex(slice) + 0.5;
+    let uu = u;
+    if (flipH) {
+        const w = orientation === 'Sagittal' ? dy : dx;
+        uu = w - u;
+    }
     if (orientation === 'Axial') {
-        return [clamp(u, 0, dx), clamp(dy - v, 0, dy), plane];
+        return [clamp(uu, 0, dx), clamp(dy - v, 0, dy), plane];
     }
     if (orientation === 'Coronal') {
-        return [clamp(u, 0, dx), plane, clamp(v, 0, dz)];
+        return [clamp(uu, 0, dx), plane, clamp(v, 0, dz)];
     }
-    return [plane, clamp(u, 0, dy), clamp(v, 0, dz)];
+    return [plane, clamp(uu, 0, dy), clamp(v, 0, dz)];
 }
 
 /**
@@ -62,10 +68,18 @@ export function sliceUvToVoxelIndex(
     u: number,
     v: number,
     slice: number,
-    dimensions: [number, number, number]
+    dimensions: [number, number, number],
+    flipH = false
 ): [number, number, number] {
     const [dx, dy, dz] = dimensions;
-    const [x, y, z] = sliceUvToVoxel(orientation, Math.floor(u) + 0.5, Math.floor(v) + 0.5, slice, dimensions);
+    const [x, y, z] = sliceUvToVoxel(
+        orientation,
+        Math.floor(u) + 0.5,
+        Math.floor(v) + 0.5,
+        slice,
+        dimensions,
+        flipH
+    );
     return [clampIndex(Math.floor(x), dx), clampIndex(Math.floor(y), dy), clampIndex(Math.floor(z), dz)];
 }
 
@@ -74,12 +88,15 @@ export function inPlaneVoxelToDisplayUv(
     orientation: SliceOrientation,
     u: number,
     v: number,
-    dimensions: [number, number, number]
+    dimensions: [number, number, number],
+    flipH = false
 ): SlicePoint {
-    if (orientation === 'Axial') {
-        return { u, v: dimensions[1] - 1 - v };
-    }
-    return { u, v };
+    const w = orientation === 'Sagittal' ? dimensions[1] : dimensions[0];
+    let du = u;
+    let dv = v;
+    if (orientation === 'Axial') dv = dimensions[1] - 1 - v;
+    if (flipH) du = w - 1 - u;
+    return { u: du, v: dv };
 }
 
 /** Hold Shift while dragging to lock the ruler to the nearer image axis. */
@@ -96,10 +113,11 @@ export function measurementLengthMm(
     orientation: SliceOrientation,
     slice: number,
     start: SlicePoint,
-    end: SlicePoint
+    end: SlicePoint,
+    flipH = false
 ): number {
-    const a = sliceUvToVoxel(orientation, start.u, start.v, slice, volume.dimensions);
-    const b = sliceUvToVoxel(orientation, end.u, end.v, slice, volume.dimensions);
+    const a = sliceUvToVoxel(orientation, start.u, start.v, slice, volume.dimensions, flipH);
+    const b = sliceUvToVoxel(orientation, end.u, end.v, slice, volume.dimensions, flipH);
     return voxelDistanceMm(volume, a, b);
 }
 
