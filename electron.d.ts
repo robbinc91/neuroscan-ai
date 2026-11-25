@@ -38,9 +38,11 @@ export interface ElectronAPI {
     onMenuImportSegmentation: (callback: () => void) => () => void;
     onMenuExportReport: (callback: () => void) => () => void;
     onMenuOpenSettings: (callback: () => void) => () => void;
+    onMenuSetViewMode: (callback: (mode: string) => void) => () => void;
 
     // File association handler
     onFileOpened: (callback: (file: { name: string; path: string; data: ArrayBuffer }) => void) => () => void;
+    takePendingOpenFile: () => Promise<{ name: string; path: string; data: ArrayBuffer } | null>;
 }
 
 declare global {

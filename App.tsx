@@ -5,15 +5,26 @@ import { ProcessingPanel } from './components/ProcessingPanel';
 import { AnalysisPanel } from './components/AnalysisPanel';
 import { ComparisonPanel, ComparisonMode } from './components/ComparisonPanel';
 import { SettingsDialog } from './components/SettingsDialog';
-import { ToolCategory, ViewMode, VolumeData, ViewportHandle, ViewportTool, Study } from './types';
-import { Menu, Upload, User, Bell, Loader2, Layers, FolderInput, Settings } from 'lucide-react';
+import { MetadataSidebar } from './components/MetadataSidebar';
+import { ToolCategory, ViewMode, VolumeData, ViewportHandle, ViewportTool, Study, WindowLevel } from './types';
+import { Menu, Loader2, Layers, FolderInput, Settings, LayoutGrid, Box, Info, FileText } from 'lucide-react';
 import { parseNiftiFile } from './utils/niftiUtils';
-import { parseDicomFiles } from './utils/dicomUtils';
+import { parseVolumeFromFile, parseVolumeFromFiles } from './utils/loadVolume';
+import { autoWindowLevel } from './utils/windowLevel';
+import { ensureVolumeMetadata, patientFooterLabel } from './utils/volumeMetadata';
 import {
     computeVolumeDifferenceWithGeometry,
     computeSegmentationDifference,
     alignSegmentationToReferenceVolume
 } from './utils/imageProcessing';
+
+const LAYOUT_OPTIONS: { id: ViewMode; label: string; shortcut: string }[] = [
+    { id: ViewMode.FourUp, label: '4-Up', shortcut: '0' },
+    { id: ViewMode.Axial, label: 'Axial', shortcut: '1' },
+    { id: ViewMode.Sagittal, label: 'Sagittal', shortcut: '2' },
+    { id: ViewMode.Coronal, label: 'Coronal', shortcut: '3' },
+    { id: ViewMode.ThreeD, label: '3D', shortcut: '4' },
+];
 
 const App: React.FC = () => {
     const [activeTool, setActiveTool] = useState<ToolCategory>(ToolCategory.Viewer);
@@ -21,6 +32,8 @@ const App: React.FC = () => {
 
     // Single Study State (Backwards Compatibility)
     const [volume, setVolume] = useState<VolumeData | null>(null);
+    const [sourceVolume, setSourceVolume] = useState<VolumeData | null>(null);
+    const [volumeHistory, setVolumeHistory] = useState<VolumeData[]>([]);
     const [segmentationVolume, setSegmentationVolume] = useState<VolumeData | null>(null);
 
     // Multi-Study Comparison State
@@ -32,16 +45,59 @@ const App: React.FC = () => {
 
     // Viewport Interaction State
     const [isLoading, setIsLoading] = useState(false);
-    const [viewportTool, setViewportTool] = useState<ViewportTool>('wl');
+    const [viewportTool, setViewportTool] = useState<ViewportTool>('crosshair');
     const [brushSize, setBrushSize] = useState(5);
+    const [windowLevel, setWindowLevel] = useState<WindowLevel | null>(null);
+    const [menuOpen, setMenuOpen] = useState(false);
 
     // Shared Position for Sync
     const [sharedPosition, setSharedPosition] = useState({ x: 128, y: 128, z: 128 });
 
     // Settings Dialog State
     const [settingsOpen, setSettingsOpen] = useState(false);
+    const [exportRequestId, setExportRequestId] = useState(0);
 
     const viewportRef = useRef<ViewportHandle>(null);
+    const volumeRef = useRef<VolumeData | null>(null);
+    const segmentationRef = useRef<VolumeData | null>(null);
+    const historyRef = useRef<VolumeData[]>([]);
+    const menuRef = useRef<HTMLDivElement>(null);
+    volumeRef.current = volume;
+    segmentationRef.current = segmentationVolume;
+    historyRef.current = volumeHistory;
+
+    const loadVolume = (parsed: VolumeData, sourceName?: string) => {
+        const next = sourceName && parsed.metadata
+            ? { ...parsed, metadata: { ...parsed.metadata, sourceName } }
+            : parsed;
+        setSourceVolume(next);
+        setVolume(next);
+        setVolumeHistory([]);
+        setSegmentationVolume(null);
+        setWindowLevel(autoWindowLevel(next));
+    };
+
+    const commitVolume = (next: VolumeData) => {
+        const prev = volumeRef.current;
+        if (prev && prev.data !== next.data) {
+            setVolumeHistory([...historyRef.current.slice(-4), prev]);
+        }
+        setVolume(next);
+    };
+
+    const undoVolume = () => {
+        const h = historyRef.current;
+        if (h.length === 0) return;
+        const prev = h[h.length - 1];
+        setVolumeHistory(h.slice(0, -1));
+        setVolume(prev);
+    };
+
+    const resetVolume = () => {
+        if (!sourceVolume) return;
+        setVolume(sourceVolume);
+        setVolumeHistory([]);
+    };
 
     // Update shared position bounds when volume loads
     useEffect(() => {
@@ -84,19 +140,12 @@ const App: React.FC = () => {
                 return;
             }
 
-            let parsedVolume: VolumeData | null = null;
-            if (files.length === 1 && (files[0].name.toLowerCase().endsWith('.nii') || files[0].name.toLowerCase().endsWith('.nii.gz'))) {
-                parsedVolume = parseNiftiFile(files[0].data);
-            } else {
-                const buffers = files.map(f => f.data);
-                parsedVolume = parseDicomFiles(buffers);
-            }
+            const parsedVolume = parseVolumeFromFiles(files);
 
             if (parsedVolume) {
-                setVolume(parsedVolume);
-                setSegmentationVolume(null);
+                loadVolume(parsedVolume, files[0].name);
             } else {
-                alert("Failed to parse file(s).");
+                alert(`Failed to parse "${files[0].name}". Expected NIfTI (.nii, .nii.gz) or DICOM (.dcm, .ima).`);
             }
         } catch (e) {
             console.error("File upload error:", e);
@@ -143,6 +192,46 @@ const App: React.FC = () => {
         setSegmentationVolume(vol ? { ...vol } : null);
     };
 
+    const requestReportExport = () => {
+        if (!volumeRef.current) {
+            alert('Load a scan before exporting a report.');
+            return;
+        }
+        if (!segmentationRef.current) {
+            setActiveTool(ToolCategory.Analysis);
+            alert('Load or create a segmentation before exporting a report.');
+            return;
+        }
+        setActiveTool(ToolCategory.Analysis);
+        setExportRequestId((n) => n + 1);
+    };
+
+    const lastOpenedKeyRef = useRef('');
+    const ingestOpenedFile = (file: { name: string; path: string; data: ArrayBuffer }) => {
+        const key = `${file.path}:${file.data.byteLength}`;
+        if (key === lastOpenedKeyRef.current) return;
+        lastOpenedKeyRef.current = key;
+        setIsLoading(true);
+        try {
+            const parsedVolume = parseVolumeFromFile(file.name, file.data);
+            if (parsedVolume) {
+                loadVolume(parsedVolume, file.name);
+            } else {
+                alert(`Failed to parse "${file.name}". Expected NIfTI (.nii, .nii.gz) or DICOM (.dcm, .ima).`);
+            }
+        } catch (e) {
+            console.error('Error opening associated file:', e);
+            alert(`Error opening "${file.name}": ${e instanceof Error ? e.message : 'Unknown error'}`);
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    const requestReportExportRef = useRef(requestReportExport);
+    requestReportExportRef.current = requestReportExport;
+    const ingestOpenedFileRef = useRef(ingestOpenedFile);
+    ingestOpenedFileRef.current = ingestOpenedFile;
+
     // Electron menu event handlers
     useEffect(() => {
         if (!window.electron) return;
@@ -155,32 +244,105 @@ const App: React.FC = () => {
             handleSegmentationUpload();
         });
 
+        const unsubscribeExportReport = window.electron.onMenuExportReport(() => {
+            requestReportExportRef.current();
+        });
+
         const unsubscribeOpenSettings = window.electron.onMenuOpenSettings(() => {
             setSettingsOpen(true);
         });
 
-        // Handle files opened via file association
-        const unsubscribeFileOpened = window.electron.onFileOpened((file) => {
-            setIsLoading(true);
-            try {
-                const parsedVolume = parseNiftiFile(file.data);
-                if (parsedVolume) {
-                    setVolume(parsedVolume);
-                }
-            } catch (e) {
-                console.error('Error opening associated file:', e);
-            } finally {
-                setIsLoading(false);
+        const unsubscribeViewMode = window.electron.onMenuSetViewMode((mode) => {
+            if (Object.values(ViewMode).includes(mode as ViewMode)) {
+                setViewMode(mode as ViewMode);
             }
+        });
+
+        const unsubscribeFileOpened = window.electron.onFileOpened((file) => {
+            ingestOpenedFileRef.current(file);
+        });
+
+        void window.electron.takePendingOpenFile().then((file) => {
+            if (file) ingestOpenedFileRef.current(file);
         });
 
         return () => {
             unsubscribeImportScan();
             unsubscribeImportSeg();
+            unsubscribeExportReport();
             unsubscribeOpenSettings();
+            unsubscribeViewMode();
             unsubscribeFileOpened();
         };
     }, []);
+
+    useEffect(() => {
+        const onKeyDown = (e: KeyboardEvent) => {
+            const target = e.target as HTMLElement | null;
+            if (target) {
+                const tag = target.tagName;
+                if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable) return;
+            }
+            if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'z' || e.key === 'Z')) {
+                if (e.shiftKey) return;
+                e.preventDefault();
+                undoVolume();
+                return;
+            }
+            if (e.ctrlKey || e.metaKey || e.altKey) return;
+            if (e.key === 'm' || e.key === 'M' || e.key === 'r' || e.key === 'R') {
+                e.preventDefault();
+                setViewportTool((t) => (t === 'measure' ? 'crosshair' : 'measure'));
+                return;
+            }
+            if (e.key === 'c' || e.key === 'C') {
+                e.preventDefault();
+                setViewportTool('crosshair');
+                return;
+            }
+            if (e.key === 'w' || e.key === 'W') {
+                e.preventDefault();
+                setViewportTool('wl');
+                return;
+            }
+            if (e.key === 'i' || e.key === 'I') {
+                e.preventDefault();
+                setActiveTool(ToolCategory.Viewer);
+                setMenuOpen(false);
+                return;
+            }
+            const next =
+                e.key === '0' || e.key === '5' ? ViewMode.FourUp
+                : e.key === '1' ? ViewMode.Axial
+                : e.key === '2' ? ViewMode.Sagittal
+                : e.key === '3' ? ViewMode.Coronal
+                : e.key === '4' ? ViewMode.ThreeD
+                : null;
+            if (!next) return;
+            e.preventDefault();
+            setViewMode(next);
+        };
+        window.addEventListener('keydown', onKeyDown);
+        return () => window.removeEventListener('keydown', onKeyDown);
+    }, []);
+
+    useEffect(() => {
+        if (!menuOpen) return;
+        const onDoc = (e: MouseEvent) => {
+            if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+                setMenuOpen(false);
+            }
+        };
+        const onEsc = (e: KeyboardEvent) => {
+            if (e.key === 'Escape') setMenuOpen(false);
+        };
+        document.addEventListener('mousedown', onDoc);
+        window.addEventListener('keydown', onEsc);
+        return () => {
+            document.removeEventListener('mousedown', onDoc);
+            window.removeEventListener('keydown', onEsc);
+        };
+    }, [menuOpen]);
 
     // Drag and drop support
     const [isDragging, setIsDragging] = useState(false);
@@ -215,22 +377,15 @@ const App: React.FC = () => {
             try {
                 let parsedVolume: VolumeData | null = null;
 
-                if (files.length === 1 && (files[0].name.toLowerCase().endsWith('.nii') || files[0].name.toLowerCase().endsWith('.nii.gz'))) {
-                    const arrayBuffer = await files[0].arrayBuffer();
-                    parsedVolume = parseNiftiFile(arrayBuffer);
-                } else {
-                    const buffers: ArrayBuffer[] = [];
-                    for (const file of files) {
-                        buffers.push(await file.arrayBuffer());
-                    }
-                    parsedVolume = parseDicomFiles(buffers);
-                }
+                const buffers = await Promise.all(
+                    files.map(async (file) => ({ name: file.name, data: await file.arrayBuffer() }))
+                );
+                parsedVolume = parseVolumeFromFiles(buffers);
 
                 if (parsedVolume) {
-                    setVolume(parsedVolume);
-                    setSegmentationVolume(null);
+                    loadVolume(parsedVolume, files[0].name);
                 } else {
-                    alert("Failed to parse dropped file(s).");
+                    alert(`Failed to parse "${files[0].name}". Expected NIfTI (.nii, .nii.gz) or DICOM (.dcm, .ima).`);
                 }
             } catch (error) {
                 console.error('Error processing dropped files:', error);
@@ -295,8 +450,12 @@ const App: React.FC = () => {
                     <ProcessingPanel
                         mode={activeTool}
                         volume={volume}
-                        onUpdateVolume={setVolume}
+                        onUpdateVolume={commitVolume}
                         onUpdateSegmentation={updateSegmentation}
+                        canUndoVolume={volumeHistory.length > 0}
+                        canResetVolume={!!volume && !!sourceVolume && volume.data !== sourceVolume.data}
+                        onUndoVolume={undoVolume}
+                        onResetVolume={resetVolume}
                         viewportTool={viewportTool}
                         onSelectViewportTool={setViewportTool}
                         brushSize={brushSize}
@@ -310,13 +469,17 @@ const App: React.FC = () => {
                         volume={volume}
                         segmentation={segmentationVolume}
                         onGenerateReport={() => viewportRef.current?.getReportImages()}
+                        exportRequestId={exportRequestId}
                     />
                 );
             case ToolCategory.Comparison:
                 return (
                     <ComparisonPanel
                         studies={studies}
-                        onAddStudy={(s) => setStudies(prev => [...prev, s])}
+                        onAddStudy={(s) => {
+                            setStudies(prev => [...prev, s]);
+                            setWindowLevel((prev) => prev ?? autoWindowLevel(s.volume));
+                        }}
                         onRemoveStudy={(id) => {
                             setStudies(prev => prev.filter(s => s.id !== id));
                             setDiffVolume(null);
@@ -331,15 +494,21 @@ const App: React.FC = () => {
                         hasComputedDiff={!!diffVolume}
                     />
                 );
+            case ToolCategory.Viewer:
             default:
-                return (
-                    <div className="p-6 text-center text-gray-500 mt-20">
-                        <h3 className="text-lg font-medium text-gray-400 mb-2">Metadata</h3>
-                        <p className="text-sm">Select a file or region to view details.</p>
-                    </div>
-                );
+                return <MetadataSidebar volume={volume ?? studies[0]?.volume ?? null} />;
         }
     };
+
+    const closeMenu = () => setMenuOpen(false);
+
+    const wlProps = {
+        windowLevel: windowLevel ?? undefined,
+        onWindowLevelChange: (wl: WindowLevel) => setWindowLevel(wl)
+    };
+
+    const footerVolume = volume ?? studies[0]?.volume ?? null;
+    const footerPatient = patientFooterLabel(footerVolume ? ensureVolumeMetadata(footerVolume) : null);
 
     return (
         <div className="flex flex-col h-screen w-screen bg-gray-950 text-gray-100 font-sans overflow-hidden">
@@ -360,13 +529,127 @@ const App: React.FC = () => {
 
 
             {/* Header */}
-            <header className="h-14 bg-gray-900 border-b border-gray-800 flex items-center justify-between px-4 z-30 shrink-0">
-                <div className="flex items-center gap-4">
-                    <button className="text-gray-400 hover:text-white"><Menu className="w-5 h-5" /></button>
+            <header className="h-14 bg-gray-900 border-b border-gray-800 flex items-center px-4 z-30 shrink-0">
+                <div className="flex-1 flex items-center gap-4 min-w-0">
+                    <div className="relative" ref={menuRef}>
+                        <button
+                            type="button"
+                            className="text-gray-400 hover:text-white"
+                            aria-haspopup="menu"
+                            aria-expanded={menuOpen}
+                            title="Menu"
+                            onClick={() => setMenuOpen((o) => !o)}
+                        >
+                            <Menu className="w-5 h-5" />
+                        </button>
+                        {menuOpen && (
+                            <div
+                                role="menu"
+                                className="absolute left-0 top-full mt-1 w-56 rounded-lg border border-gray-700 bg-gray-900 py-1 shadow-xl z-50"
+                            >
+                                <button
+                                    type="button"
+                                    role="menuitem"
+                                    className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-gray-200 hover:bg-gray-800"
+                                    onClick={() => { closeMenu(); handleFileUpload(); }}
+                                >
+                                    <FolderInput className="w-3.5 h-3.5 text-gray-400" />
+                                    Import Scan
+                                </button>
+                                <button
+                                    type="button"
+                                    role="menuitem"
+                                    className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-40"
+                                    disabled={!volume}
+                                    onClick={() => { closeMenu(); handleSegmentationUpload(); }}
+                                >
+                                    <Layers className="w-3.5 h-3.5 text-green-400" />
+                                    Load Segmentation
+                                </button>
+                                <button
+                                    type="button"
+                                    role="menuitem"
+                                    className="flex w-full items-center justify-between px-3 py-1.5 text-left text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-40"
+                                    disabled={!volume || !segmentationVolume}
+                                    onClick={() => { closeMenu(); requestReportExport(); }}
+                                >
+                                    <span className="flex items-center gap-2">
+                                        <FileText className="w-3.5 h-3.5 text-cyan-400" />
+                                        Export Report
+                                    </span>
+                                    <span className="font-mono text-[10px] text-gray-500">Ctrl+E</span>
+                                </button>
+                                <div className="my-1 h-px bg-gray-800" />
+                                {LAYOUT_OPTIONS.map((opt) => (
+                                    <button
+                                        key={opt.id}
+                                        type="button"
+                                        role="menuitem"
+                                        className={`flex w-full items-center justify-between px-3 py-1.5 text-left text-xs hover:bg-gray-800 ${
+                                            viewMode === opt.id ? 'text-cyan-300' : 'text-gray-200'
+                                        }`}
+                                        onClick={() => { setViewMode(opt.id); closeMenu(); }}
+                                    >
+                                        <span className="flex items-center gap-2">
+                                            {opt.id === ViewMode.FourUp ? <LayoutGrid className="w-3.5 h-3.5" /> : null}
+                                            {opt.id === ViewMode.ThreeD ? <Box className="w-3.5 h-3.5" /> : null}
+                                            {opt.label}
+                                        </span>
+                                        <span className="font-mono text-[10px] text-gray-500">{opt.shortcut}</span>
+                                    </button>
+                                ))}
+                                <div className="my-1 h-px bg-gray-800" />
+                                <button
+                                    type="button"
+                                    role="menuitem"
+                                    className="flex w-full items-center justify-between px-3 py-1.5 text-left text-xs text-gray-200 hover:bg-gray-800"
+                                    onClick={() => { setActiveTool(ToolCategory.Viewer); closeMenu(); }}
+                                >
+                                    <span className="flex items-center gap-2">
+                                        <Info className="w-3.5 h-3.5 text-cyan-400" />
+                                        Scan Metadata
+                                    </span>
+                                    <span className="font-mono text-[10px] text-gray-500">I</span>
+                                </button>
+                                <button
+                                    type="button"
+                                    role="menuitem"
+                                    className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-gray-200 hover:bg-gray-800"
+                                    onClick={() => { setSettingsOpen(true); closeMenu(); }}
+                                >
+                                    <Settings className="w-3.5 h-3.5 text-gray-400" />
+                                    Settings
+                                </button>
+                            </div>
+                        )}
+                    </div>
                     <h1 className="text-lg font-bold tracking-tight flex items-center gap-2"><span className="text-cyan-400">NeuroScan</span> AI</h1>
                     <span className="bg-gray-800 text-xs px-2 py-0.5 rounded text-gray-400 border border-gray-700">v2.6-diff</span>
                 </div>
-                <div className="flex items-center gap-3">
+                <div className="flex items-center gap-0.5 bg-gray-800/80 rounded-lg p-0.5 border border-gray-700" role="tablist" aria-label="Viewport layout">
+                    {LAYOUT_OPTIONS.map((opt) => {
+                        const active = viewMode === opt.id;
+                        return (
+                            <button
+                                key={opt.id}
+                                role="tab"
+                                aria-selected={active}
+                                onClick={() => setViewMode(opt.id)}
+                                title={`${opt.label} (${opt.shortcut})`}
+                                className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-medium uppercase tracking-wide transition-colors ${
+                                    active
+                                        ? 'bg-cyan-900/70 text-cyan-300'
+                                        : 'text-gray-400 hover:text-gray-200 hover:bg-gray-700/80'
+                                }`}
+                            >
+                                {opt.id === ViewMode.FourUp ? <LayoutGrid className="w-3.5 h-3.5" /> : null}
+                                {opt.id === ViewMode.ThreeD ? <Box className="w-3.5 h-3.5" /> : null}
+                                {opt.label}
+                            </button>
+                        );
+                    })}
+                </div>
+                <div className="flex-1 flex items-center justify-end gap-3">
                     {activeTool !== ToolCategory.Comparison && (
                         <>
                             <button onClick={handleFileUpload} className="flex items-center gap-2 bg-gray-800 hover:bg-gray-700 text-sm px-3 py-1.5 rounded transition-colors border border-gray-700 disabled:opacity-50" disabled={isLoading}>
@@ -403,11 +686,13 @@ const App: React.FC = () => {
                                         </div>
                                         <Viewport
                                             viewMode={viewMode}
+                                            onViewModeChange={setViewMode}
                                             {...getComparisonViewportContent()}
                                             tool={viewportTool}
                                             onToolChange={setViewportTool}
                                             position={sharedPosition}
                                             onPositionChange={setSharedPosition}
+                                            {...wlProps}
                                         />
                                     </div>
                                 ) : (
@@ -420,12 +705,14 @@ const App: React.FC = () => {
                                             </div>
                                             <Viewport
                                                 viewMode={viewMode}
+                                                onViewModeChange={setViewMode}
                                                 volume={studies[0].volume}
                                                 segmentation={studies[0].segmentation}
                                                 tool={viewportTool}
                                                 onToolChange={setViewportTool}
                                                 position={sharedPosition}
                                                 onPositionChange={setSharedPosition}
+                                                {...wlProps}
                                             />
                                         </div>
                                         {/* Right Viewport (Difference or Follow-up) */}
@@ -435,11 +722,14 @@ const App: React.FC = () => {
                                             </div>
                                             <Viewport
                                                 viewMode={viewMode}
+                                                onViewModeChange={setViewMode}
                                                 {...getComparisonViewportContent()}
                                                 tool={viewportTool}
                                                 onToolChange={setViewportTool}
                                                 position={sharedPosition}
                                                 onPositionChange={setSharedPosition}
+                                                enableSliceKeys={false}
+                                                {...wlProps}
                                             />
                                         </div>
                                     </div>
@@ -454,12 +744,14 @@ const App: React.FC = () => {
                                     )}
                                     <Viewport
                                         viewMode={viewMode}
+                                        onViewModeChange={setViewMode}
                                         volume={studies.length > 0 ? studies[0].volume : null}
                                         segmentation={studies.length > 0 ? studies[0].segmentation : null}
                                         tool={viewportTool}
                                         onToolChange={setViewportTool}
                                         position={sharedPosition}
                                         onPositionChange={setSharedPosition}
+                                        {...wlProps}
                                     />
                                 </div>
                             )
@@ -468,6 +760,7 @@ const App: React.FC = () => {
                             <Viewport
                                 ref={viewportRef}
                                 viewMode={viewMode}
+                                onViewModeChange={setViewMode}
                                 volume={volume}
                                 segmentation={segmentationVolume}
                                 tool={viewportTool}
@@ -476,32 +769,36 @@ const App: React.FC = () => {
                                 onUpdateSegmentation={updateSegmentation}
                                 position={sharedPosition}
                                 onPositionChange={setSharedPosition}
+                                {...wlProps}
                             />
                         )}
                     </div>
 
                     <div className="h-6 bg-gray-900 border-t border-gray-800 flex items-center justify-between px-4 text-[10px] text-gray-500 uppercase tracking-wider shrink-0 z-20">
-                        <div>Patient: ID-9382-AC | {activeTool === ToolCategory.Comparison ? 'Comparison Mode' : 'Standard Viewer'}</div>
+                        <div>
+                            {footerPatient} | {activeTool === ToolCategory.Comparison ? 'Comparison Mode' : 'Standard Viewer'} | Layout {viewMode.replace('_', '-')} (0–4)
+                            {viewportTool === 'measure' ? ' | Measure: drag · Shift axis-lock · Esc cancel · Delete last' : ' | Click crosshair · Right-drag W/L · Arrows/wheel slice · I metadata'}
+                            {activeTool === ToolCategory.Processing ? ' | Ctrl+Z undo processing' : ''}
+                        </div>
                         <div className="flex items-center gap-2">
                             {(volume || (activeTool === ToolCategory.Comparison && studies.length > 0)) && <span className="text-cyan-500">Scan Active</span>}
                         </div>
                     </div>
                 </main>
 
-                {activeTool !== ToolCategory.Viewer && (
-                    <aside className="w-80 bg-gray-900 border-l border-gray-800 flex flex-col z-10 shadow-xl overflow-hidden shrink-0">
-                        <div className="h-10 border-b border-gray-800 flex items-center px-4 font-medium text-sm text-gray-200 shrink-0">
-                            {activeTool === ToolCategory.Processing && 'Image Processing Pipeline'}
-                            {activeTool === ToolCategory.Segmentation && 'Segmentation Tools'}
-                            {activeTool === ToolCategory.Analysis && 'Quantitative Analysis'}
-                            {activeTool === ToolCategory.Reporting && 'AI Reporting'}
-                            {activeTool === ToolCategory.Comparison && 'Multi-Study Comparison'}
-                        </div>
-                        <div className="flex-1 overflow-hidden">
-                            {renderRightPanel()}
-                        </div>
-                    </aside>
-                )}
+                <aside className="w-80 bg-gray-900 border-l border-gray-800 flex flex-col z-10 shadow-xl overflow-hidden shrink-0">
+                    <div className="h-10 border-b border-gray-800 flex items-center px-4 font-medium text-sm text-gray-200 shrink-0">
+                        {activeTool === ToolCategory.Viewer && 'Scan Metadata'}
+                        {activeTool === ToolCategory.Processing && 'Image Processing Pipeline'}
+                        {activeTool === ToolCategory.Segmentation && 'Segmentation Tools'}
+                        {activeTool === ToolCategory.Analysis && 'Quantitative Analysis'}
+                        {activeTool === ToolCategory.Reporting && 'AI Reporting'}
+                        {activeTool === ToolCategory.Comparison && 'Multi-Study Comparison'}
+                    </div>
+                    <div className="flex-1 overflow-hidden">
+                        {renderRightPanel()}
+                    </div>
+                </aside>
             </div>
         </div>
     );

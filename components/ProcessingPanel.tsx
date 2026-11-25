@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { ProcessingMethod, ToolCategory, VolumeData, ViewportTool } from '../types';
-import { Play, RotateCcw, Save, Loader2, Check, Trash2, Sliders, Wand2, UploadCloud, CloudLightning, Server, RefreshCw, Info, Cpu, PenTool, Eraser, Hand, MousePointer2 } from 'lucide-react';
+import { ToolCategory, VolumeData, ViewportTool } from '../types';
+import { Play, RotateCcw, Loader2, Check, Trash2, Sliders, Wand2, UploadCloud, CloudLightning, Server, RefreshCw, PenTool, Eraser, MousePointer2, Hand, Info, Cpu } from 'lucide-react';
 import { parseNiftiFile } from '../utils/niftiUtils';
 import { volumeGeometryJson } from '../utils/volumeGeometry';
+import { cancelVolumeJob, runProcessJob, runSegmentJob, VolumeJobCancelled } from '../utils/volumeJob';
 
 interface ProcessingPanelProps {
     mode: ToolCategory;
@@ -13,6 +14,10 @@ interface ProcessingPanelProps {
     onSelectViewportTool?: (tool: ViewportTool) => void;
     brushSize?: number;
     onBrushSizeChange?: (size: number) => void;
+    canUndoVolume?: boolean;
+    canResetVolume?: boolean;
+    onUndoVolume?: () => void;
+    onResetVolume?: () => void;
 }
 
 interface ExternalModel {
@@ -27,7 +32,8 @@ interface ExternalModel {
 
 export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({ 
     mode, volume, onUpdateSegmentation, onUpdateVolume,
-    viewportTool, onSelectViewportTool, brushSize, onBrushSizeChange
+    viewportTool, onSelectViewportTool, brushSize, onBrushSizeChange,
+    canUndoVolume, canResetVolume, onUndoVolume, onResetVolume
 }) => {
     const [isProcessing, setIsProcessing] = useState(false);
     const [progress, setProgress] = useState(0);
@@ -45,6 +51,7 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
     const [manualThreshold, setManualThreshold] = useState(0);
     const [manualUpper, setManualUpper] = useState(0);
     const [localKernel, setLocalKernel] = useState(5);
+    const [localOffset, setLocalOffset] = useState(2);
 
     // External Segmentation State
     const [serverUrl, setServerUrl] = useState('http://localhost:8000');
@@ -68,8 +75,11 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
         if (procMethod.includes('gamma')) setParam1(procMethod === 'gamma_bright' ? 0.6 : 1.5);
         else if (procMethod === 'sigmoid') { setParam1(10); setParam2(0.5); }
         else if (procMethod === 'clahe') setParam1(2.0); // Clip limit
-        else if (procMethod === 'gaussian' || procMethod === 'unsharp') setParam1(1.0);
+        else if (procMethod === 'gaussian') setParam1(1.0);
+        else if (procMethod === 'unsharp') setParam1(1.0);
+        else if (procMethod === 'median_3d') setParam1(1);
         else if (procMethod === 'tv_denoise') setParam1(10); // Iterations
+        else if (procMethod === 'n4_bias') { setParam1(50); setParam2(8); }
         else setParam1(1.0);
         setCompleted(false);
     }, [procMethod]);
@@ -81,7 +91,7 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
                 onSelectViewportTool?.('brush');
             } else if (viewportTool === 'brush' || viewportTool === 'eraser') {
                 // If switching away from manual draw, reset to pointer if currently on brush
-                onSelectViewportTool?.('wl');
+                onSelectViewportTool?.('crosshair');
             }
         }
     }, [segMethod, mode]);
@@ -100,356 +110,36 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
         }
     };
 
-    // --- SEGMENTATION ALGORITHMS ---
-
-    const getHistogram = (data: any, min: number, max: number) => {
-        const histogram = new Int32Array(256);
-        const range = max - min || 1;
-        const step = 256 / range;
-        const len = data.length;
-        const stride = len > 2_000_000 ? Math.floor(len / 500_000) : 1;
-        
-        for (let i = 0; i < len; i += stride) {
-            const val = data[i];
-            const bin = Math.floor((val - min) * step);
-            if (bin >= 0 && bin < 256) histogram[bin]++;
-        }
-        return { histogram, step };
-    };
-
-    const computeOtsuThreshold = (histogram: Int32Array, total: number) => {
-        let sum = 0;
-        for (let i = 0; i < 256; i++) sum += i * histogram[i];
-
-        let sumB = 0;
-        let wB = 0;
-        let wF = 0;
-        let maxVar = 0;
-        let threshold = 0;
-
-        for (let t = 0; t < 256; t++) {
-            wB += histogram[t];
-            if (wB === 0) continue;
-            wF = total - wB;
-            if (wF === 0) break;
-
-            sumB += t * histogram[t];
-            const mB = sumB / wB;
-            const mF = (sum - sumB) / wF;
-
-            const varBetween = wB * wF * (mB - mF) * (mB - mF);
-            if (varBetween > maxVar) {
-                maxVar = varBetween;
-                threshold = t;
-            }
-        }
-        return threshold;
-    };
-
-    // Simplified Li's Method (Iterative Minimum Cross Entropy)
-    const computeLiThreshold = (histogram: Int32Array, total: number) => {
-        let mean = 0;
-        for(let i=0; i<256; i++) mean += i * histogram[i];
-        mean /= total;
-
-        let threshold = Math.round(mean);
-        let newThreshold = threshold;
-        
-        // Iterate (max 50 to prevent hang)
-        for(let iter=0; iter<50; iter++) {
-            let sumB = 0, wB = 0;
-            let sumF = 0, wF = 0;
-
-            for(let i=0; i<=threshold; i++) {
-                wB += histogram[i];
-                sumB += i * histogram[i];
-            }
-            for(let i=threshold+1; i<256; i++) {
-                wF += histogram[i];
-                sumF += i * histogram[i];
-            }
-            
-            if (wB === 0 || wF === 0) break;
-
-            const mB = sumB / wB;
-            const mF = sumF / wF;
-            
-            // Li's formula approximation update
-            const temp = (mF - mB) / (Math.log(mF) - Math.log(mB));
-            newThreshold = Math.round(temp);
-            
-            if (newThreshold === threshold) break;
-            threshold = newThreshold;
-        }
-        return threshold;
-    };
-
-    // --- PROCESSING PIPELINE ---
+    useEffect(() => {
+        return () => cancelVolumeJob();
+    }, []);
 
     const runProcessing = async () => {
         if (!volume || !onUpdateVolume) return;
+        cancelVolumeJob();
         setIsProcessing(true);
         setCompleted(false);
         setProgress(0);
-        await new Promise(resolve => setTimeout(resolve, 50)); // UI refresh
 
         try {
-            const { data, min, max, dimensions } = volume;
-            const [width, height, depth] = dimensions;
-            const len = data.length;
-            const newData = new Float32Array(len);
-            
-            // Initial Copy
-            newData.set(data);
-
-            const range = max - min || 1;
-
-            const updateProgress = async (val: number) => {
-                setProgress(val);
-                await new Promise(r => setTimeout(r, 0));
-            };
-            
-            if (procMethod === 'hist_eq') {
-                const { histogram } = getHistogram(data, min, max);
-                const cdf = new Int32Array(256);
-                let sum = 0;
-                for(let i=0; i<256; i++) { sum += histogram[i]; cdf[i] = sum; }
-                const total = sum;
-                
-                const CHUNK_SIZE = 500000;
-                for(let i=0; i<len; i+=CHUNK_SIZE) {
-                    const end = Math.min(i+CHUNK_SIZE, len);
-                    for(let j=i; j<end; j++) {
-                        const bin = Math.floor(((data[j] - min) / range) * 255);
-                        const normVal = cdf[Math.max(0, Math.min(255, bin))] / total;
-                        newData[j] = min + normVal * range;
-                    }
-                    await updateProgress(Math.floor((i/len)*100));
-                }
-            } 
-            else if (procMethod === 'clahe') {
-                // Slice-wise Contrast Limited Histogram Equalization approximation
-                const clipLimit = param1;
-                for (let z=0; z<depth; z++) {
-                    const offset = z * width * height;
-                    const sliceEnd = offset + width * height;
-                    const sliceData = data.subarray(offset, sliceEnd);
-                    
-                    let sMin = Infinity, sMax = -Infinity;
-                    for(let k=0; k<sliceData.length; k++) {
-                        if(sliceData[k] < sMin) sMin = sliceData[k];
-                        if(sliceData[k] > sMax) sMax = sliceData[k];
-                    }
-                    const sRange = sMax - sMin || 1;
-                    
-                    const hist = new Int32Array(256);
-                    for(let k=0; k<sliceData.length; k++) {
-                        const bin = Math.floor(((sliceData[k] - sMin) / sRange) * 255);
-                        hist[Math.max(0, Math.min(255, bin))]++;
-                    }
-                    
-                    const limit = (sliceData.length / 256) * clipLimit;
-                    let excess = 0;
-                    for(let k=0; k<256; k++) {
-                        if (hist[k] > limit) {
-                            excess += hist[k] - limit;
-                            hist[k] = limit;
-                        }
-                    }
-                    const increment = excess / 256;
-                    for(let k=0; k<256; k++) hist[k] += increment;
-                    
-                    const cdf = new Float32Array(256);
-                    let sum = 0;
-                    for(let k=0; k<256; k++) { sum += hist[k]; cdf[k] = sum / sliceData.length; }
-                    
-                    for(let k=0; k<sliceData.length; k++) {
-                        const bin = Math.floor(((sliceData[k] - sMin) / sRange) * 255);
-                        newData[offset + k] = sMin + cdf[Math.max(0, Math.min(255, bin))] * sRange;
-                    }
-                    if (z % 5 === 0) await updateProgress(Math.floor((z/depth)*100));
-                }
-            }
-            else if (procMethod === 'gamma_bright' || procMethod === 'gamma_dark') {
-                const gamma = param1; 
-                for(let i=0; i<len; i+=500000) {
-                    const end = Math.min(i+500000, len);
-                    for(let j=i; j<end; j++) {
-                        const norm = Math.max(0, (data[j] - min) / range);
-                        newData[j] = min + Math.pow(norm, gamma) * range;
-                    }
-                    await updateProgress(Math.floor((i/len)*100));
-                }
-            }
-            else if (procMethod === 'sigmoid') {
-                const gain = param1; 
-                const cutoff = param2; 
-                for(let i=0; i<len; i+=500000) {
-                    const end = Math.min(i+500000, len);
-                    for(let j=i; j<end; j++) {
-                        const u = (data[j] - min) / range;
-                        const val = 1 / (1 + Math.exp(-gain * (u - cutoff)));
-                        newData[j] = min + val * range;
-                    }
-                    await updateProgress(Math.floor((i/len)*100));
-                }
-            }
-            else if (procMethod === 'gaussian') {
-                // Separable 3-pass Box Blur approximation
-                const buf = new Float32Array(len);
-                buf.set(data);
-                const k = [0.2, 0.6, 0.2]; 
-                const idx = (x:number, y:number, z:number) => z*width*height + y*width + x;
-
-                // X-pass
-                for(let z=0; z<depth; z++) {
-                    for(let y=0; y<height; y++) {
-                        for(let x=1; x<width-1; x++) {
-                            const i = idx(x,y,z);
-                            newData[i] = buf[i-1]*k[0] + buf[i]*k[1] + buf[i+1]*k[2];
-                        }
-                    }
-                    if (z % 10 === 0) await updateProgress(33 * (z/depth));
-                }
-                buf.set(newData);
-                
-                // Y-pass
-                for(let z=0; z<depth; z++) {
-                    for(let y=1; y<height-1; y++) {
-                        for(let x=0; x<width; x++) {
-                            const i = idx(x,y,z);
-                            newData[i] = buf[i-width]*k[0] + buf[i]*k[1] + buf[i+width]*k[2];
-                        }
-                    }
-                    if (z % 10 === 0) await updateProgress(33 + 33 * (z/depth));
-                }
-                buf.set(newData);
-
-                // Z-pass
-                const sliceSize = width * height;
-                for(let z=1; z<depth-1; z++) {
-                    for(let y=0; y<height; y++) {
-                        for(let x=0; x<width; x++) {
-                            const i = idx(x,y,z);
-                            newData[i] = buf[i-sliceSize]*k[0] + buf[i]*k[1] + buf[i+sliceSize]*k[2];
-                        }
-                    }
-                    if (z % 10 === 0) await updateProgress(66 + 33 * (z/depth));
-                }
-            }
-            else if (procMethod === 'unsharp') {
-                const strength = param1;
-                // Simple blur first (box 1D average)
-                const blurred = new Float32Array(len);
-                const buf = new Float32Array(len);
-                buf.set(data);
-                
-                for(let i=width+1; i<len-width-1; i++) {
-                     blurred[i] = (buf[i-1] + buf[i] + buf[i+1] + buf[i-width] + buf[i+width]) / 5;
-                }
-                
-                for(let i=0; i<len; i++) {
-                    const mask = data[i] - blurred[i];
-                    newData[i] = data[i] + strength * mask;
-                    if (i % 500000 === 0) await updateProgress(Math.floor((i/len)*100));
-                }
-            }
-            else if (procMethod === 'hist_match') {
-                if (!referenceVolume) throw new Error("Reference volume missing");
-                
-                const { histogram: hSrc } = getHistogram(data, min, max);
-                const cdfSrc = new Float32Array(256);
-                let sumSrc = 0;
-                for(let i=0; i<256; i++) { sumSrc += hSrc[i]; cdfSrc[i] = sumSrc; }
-                for(let i=0; i<256; i++) cdfSrc[i] /= sumSrc;
-
-                const { histogram: hRef } = getHistogram(referenceVolume.data, referenceVolume.min, referenceVolume.max);
-                const cdfRef = new Float32Array(256);
-                let sumRef = 0;
-                for(let i=0; i<256; i++) { sumRef += hRef[i]; cdfRef[i] = sumRef; }
-                for(let i=0; i<256; i++) cdfRef[i] /= sumRef;
-
-                const mapping = new Float32Array(256);
-                for(let i=0; i<256; i++) {
-                    const srcVal = cdfSrc[i];
-                    let closestIdx = 0, minDiff = 1;
-                    for(let j=0; j<256; j++) {
-                        const diff = Math.abs(cdfRef[j] - srcVal);
-                        if(diff < minDiff) { minDiff = diff; closestIdx = j; }
-                    }
-                    mapping[i] = closestIdx;
-                }
-
-                const refRange = referenceVolume.max - referenceVolume.min || 1;
-                for(let i=0; i<len; i++) {
-                    const bin = Math.floor(((data[i] - min) / range) * 255);
-                    const mappedBin = mapping[Math.max(0, Math.min(255, bin))];
-                    newData[i] = referenceVolume.min + (mappedBin / 255) * refRange;
-                    if (i % 500000 === 0) await updateProgress(Math.floor((i/len)*100));
-                }
-            }
-            else if (procMethod === 'n4_bias') {
-                // Pseudo N4 (Vignette Correction)
-                for(let i=0; i<len; i++) {
-                     const z = Math.floor(i / (width * height));
-                     const rem = i % (width * height);
-                     const y = Math.floor(rem / width);
-                     const x = rem % width;
-                     
-                     const dx = (x - width/2) / (width/2);
-                     const dy = (y - height/2) / (height/2);
-                     const dz = (z - depth/2) / (depth/2);
-                     
-                     const distSq = dx*dx + dy*dy + dz*dz;
-                     const bias = 1.0 - 0.3 * distSq; 
-                     newData[i] = data[i] / Math.max(0.1, bias);
-                }
-                await updateProgress(100);
-            }
-            else if (procMethod === 'median_3d') {
-                // 3x3 Median (Slice-wise)
-                 for(let z=0; z<depth; z++) {
-                    const offset = z * width * height;
-                    const sliceData = data.subarray(offset, offset + width * height);
-                    const outSlice = newData.subarray(offset, offset + width * height);
-                    
-                    for(let y=1; y<height-1; y++) {
-                        for(let x=1; x<width-1; x++) {
-                            const i = y*width + x;
-                            const neighbors = [
-                                sliceData[i-width-1], sliceData[i-width], sliceData[i-width+1],
-                                sliceData[i-1],       sliceData[i],       sliceData[i+1],
-                                sliceData[i+width-1], sliceData[i+width], sliceData[i+width+1]
-                            ];
-                            neighbors.sort((a,b)=>a-b);
-                            outSlice[i] = neighbors[4];
-                        }
-                    }
-                    if (z % 5 === 0) await updateProgress(Math.floor((z/depth)*100));
-                }
-            }
-
-            // Recalculate Min/Max
-            let newMin = Infinity, newMax = -Infinity;
-            for(let i=0; i<len; i+=10) {
-                if (newData[i] < newMin) newMin = newData[i];
-                if (newData[i] > newMax) newMax = newData[i];
-            }
-
-            if (onUpdateVolume) {
-                onUpdateVolume({
-                    ...volume,
-                    data: newData,
-                    min: newMin,
-                    max: newMax
-                });
-            }
+            const job = runProcessJob(volume, procMethod, param1, param2, {
+                reference: procMethod === 'hist_match' ? referenceVolume : null,
+                onProgress: setProgress
+            });
+            const result = await job.promise;
+            onUpdateVolume({
+                ...volume,
+                data: result.data,
+                min: result.min,
+                max: result.max,
+                geometryNotes: result.geometryNotes ?? volume.geometryNotes
+            });
             setCompleted(true);
             setProgress(100);
-
-        } catch (e: any) {
+        } catch (e: unknown) {
+            if (e instanceof VolumeJobCancelled) return;
             console.error(e);
-            alert("Processing failed: " + (e.message || "Unknown error"));
+            alert('Processing failed: ' + (e instanceof Error ? e.message : 'Unknown error'));
         } finally {
             setIsProcessing(false);
         }
@@ -462,99 +152,35 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
             return;
         }
 
+        cancelVolumeJob();
         setIsProcessing(true);
         setCompleted(false);
         setProgress(0);
 
-        await new Promise(resolve => setTimeout(resolve, 50));
-
         try {
-            const { data, min, max } = volume;
-            const len = data.length;
-            const mask = new Uint8Array(len);
-            
-            let threshold = manualThreshold;
-            let upperThreshold = manualUpper;
-            let thresholdBin = 0;
-
-            if (['otsu', 'li', 'multi_otsu'].includes(segMethod)) {
-                const { histogram, step } = getHistogram(data, min, max);
-                let total = 0;
-                for(let i=0; i<256; i++) total += histogram[i];
-                
-                if (segMethod === 'otsu') {
-                    thresholdBin = computeOtsuThreshold(histogram, total);
-                    threshold = min + (thresholdBin / step);
-                } else if (segMethod === 'li') {
-                    thresholdBin = computeLiThreshold(histogram, total);
-                    threshold = min + (thresholdBin / step);
-                } else if (segMethod === 'multi_otsu') {
-                    const t1Bin = computeOtsuThreshold(histogram, total);
-                    
-                    const hist2 = new Int32Array(256);
-                    let total2 = 0;
-                    for(let i=t1Bin; i<256; i++) {
-                        hist2[i] = histogram[i];
-                        total2 += histogram[i];
-                    }
-                    const t2Bin = computeOtsuThreshold(hist2, total2);
-                    
-                    threshold = min + (t1Bin / step);
-                    upperThreshold = min + (Math.max(t1Bin+1, t2Bin) / step);
-                }
-            }
-
-            const CHUNK_SIZE = 500000;
-            
-            for (let i = 0; i < len; i += CHUNK_SIZE) {
-                const end = Math.min(i + CHUNK_SIZE, len);
-                
-                for (let j = i; j < end; j++) {
-                    const val = data[j];
-                    
-                    if (segMethod === 'binary' || segMethod === 'truncate') {
-                        if (val >= threshold) mask[j] = 1;
-                    } 
-                    else if (segMethod === 'binary_inv') {
-                        if (val <= threshold) mask[j] = 1;
-                    }
-                    else if (segMethod === 'range_pass') {
-                        if (val >= threshold && val <= upperThreshold) mask[j] = 1;
-                    }
-                    else if (segMethod === 'otsu' || segMethod === 'li') {
-                         if (val >= threshold) mask[j] = 1;
-                    }
-                    else if (segMethod === 'multi_otsu') {
-                        if (val >= threshold && val < upperThreshold) mask[j] = 1; // Class 1
-                        else if (val >= upperThreshold) mask[j] = 2; // Class 2
-                    }
-                    else if (segMethod === 'local_adaptive') {
-                        if (val >= threshold) mask[j] = 3;
-                    }
-                }
-                
-                const currentProgress = 10 + Math.floor(((i + CHUNK_SIZE) / len) * 80);
-                setProgress(Math.min(90, currentProgress));
-                await new Promise(resolve => setTimeout(resolve, 0));
-            }
-
-            const segVol: VolumeData = {
+            const job = runSegmentJob(volume, segMethod, {
+                manualThreshold,
+                manualUpper,
+                localKernel,
+                localOffset
+            }, { onProgress: setProgress });
+            const result = await job.promise;
+            onUpdateSegmentation({
                 header: { ...volume.header, datatypeCode: 2 },
                 dimensions: [volume.dimensions[0], volume.dimensions[1], volume.dimensions[2]],
-                min: 0,
-                max: 255,
-                data: mask,
+                min: result.min,
+                max: result.max,
+                data: result.data,
                 affine: volume.affine ? [...volume.affine] : undefined,
                 coordSystem: volume.coordSystem,
-                geometryNotes: 'local_threshold_segmentation'
-            };
-
-            onUpdateSegmentation(segVol);
+                geometryNotes: result.geometryNotes
+            });
             setCompleted(true);
             setProgress(100);
-        } catch (e) {
+        } catch (e: unknown) {
+            if (e instanceof VolumeJobCancelled) return;
             console.error(e);
-            alert("Segmentation failed");
+            alert('Segmentation failed: ' + (e instanceof Error ? e.message : 'Unknown error'));
         } finally {
             setIsProcessing(false);
         }
@@ -715,11 +341,11 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
                             </optgroup>
                             <optgroup label="Filtering / Denoising">
                                 <option value="unsharp">8. Unsharp Masking (Sharpen Edges)</option>
-                                <option value="gaussian">10. Gaussian Smoothing (Reduce Noise)</option>
-                                <option value="median_3d">11. 3D Median Filter (Edge-Preserving Noise)</option>
+                                <option value="gaussian">10. Gaussian Smoothing (3D)</option>
+                                <option value="median_3d">11. 3D Median Filter</option>
                             </optgroup>
                             <optgroup label="Bias Field Correction">
-                                <option value="n4_bias">13. N4 Bias Field Correction (Approx)</option>
+                                <option value="n4_bias">13. N4 Bias Field Correction</option>
                             </optgroup>
                         </select>
                          <div className="absolute inset-y-0 right-0 flex items-center px-2 pointer-events-none text-gray-400">
@@ -805,6 +431,74 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
                             </div>
                          )}
 
+                         {procMethod === 'gaussian' && (
+                            <div className="space-y-1">
+                                <label className="flex justify-between text-xs text-gray-400">
+                                    <span>Sigma (voxels)</span>
+                                    <span className="font-mono">{param1.toFixed(2)}</span>
+                                </label>
+                                <input
+                                    type="range" min="0.3" max="4.0" step="0.1"
+                                    value={param1}
+                                    onChange={(e) => setParam1(Number(e.target.value))}
+                                    className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+                                />
+                                <div className="text-[10px] text-gray-500 italic leading-snug">
+                                    Separable 3D Gaussian (X/Y/Z). Kernel radius is 3σ; edges use reflect padding.
+                                </div>
+                            </div>
+                         )}
+
+                         {procMethod === 'median_3d' && (
+                            <div className="space-y-1">
+                                <label className="flex justify-between text-xs text-gray-400">
+                                    <span>Neighborhood</span>
+                                    <span className="font-mono">{Math.round(param1) === 2 ? '5×5×5' : '3×3×3'}</span>
+                                </label>
+                                <input
+                                    type="range" min="1" max="2" step="1"
+                                    value={param1}
+                                    onChange={(e) => setParam1(Number(e.target.value))}
+                                    className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+                                />
+                                <div className="text-[10px] text-gray-500 italic leading-snug">
+                                    True 3D median over the chosen cube. 5×5×5 is slower on large volumes.
+                                </div>
+                            </div>
+                         )}
+
+                         {procMethod === 'n4_bias' && (
+                             <>
+                                <div className="space-y-1">
+                                    <label className="flex justify-between text-xs text-gray-400">
+                                        <span>B-spline mesh spacing (mm)</span>
+                                        <span className="font-mono">{param1.toFixed(0)}</span>
+                                    </label>
+                                    <input
+                                        type="range" min="20" max="120" step="5"
+                                        value={param1}
+                                        onChange={(e) => setParam1(Number(e.target.value))}
+                                        className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+                                    />
+                                </div>
+                                <div className="space-y-1">
+                                    <label className="flex justify-between text-xs text-gray-400">
+                                        <span>Iterations per level</span>
+                                        <span className="font-mono">{Math.round(param2)}</span>
+                                    </label>
+                                    <input
+                                        type="range" min="2" max="20" step="1"
+                                        value={param2}
+                                        onChange={(e) => setParam2(Number(e.target.value))}
+                                        className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+                                    />
+                                </div>
+                                <div className="text-[10px] text-gray-500 italic leading-snug">
+                                    Hierarchical N4: Otsu mask, log-domain Wiener histogram sharpening, cubic B-spline bias field. Background is left unchanged.
+                                </div>
+                             </>
+                         )}
+
                          {procMethod === 'hist_match' && (
                             <div className="space-y-2 pt-1">
                                 <label className="text-xs text-gray-400 flex justify-between">
@@ -834,14 +528,48 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
                     </div>
                 </div>
 
-                 <button 
-                    onClick={runProcessing}
-                    disabled={isProcessing || !volume || (procMethod === 'hist_match' && !referenceVolume)}
-                    className="mt-auto w-full py-3 bg-cyan-600 hover:bg-cyan-500 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded-lg flex items-center justify-center gap-2 transition-colors shadow-lg"
-                >
-                    {isProcessing ? <Loader2 className="animate-spin w-4 h-4"/> : completed ? <Check className="w-4 h-4"/> : <Wand2 className="w-4 h-4" />}
-                    {isProcessing ? `Running ${progress}%` : completed ? 'Complete' : 'Run Pipeline'}
-                </button>
+                 <div className="mt-auto space-y-2">
+                    <div className="text-[10px] text-gray-500 leading-snug">
+                        Runs in a background worker. The loaded scan is kept; Run Pipeline writes a copy.
+                    </div>
+                    <button 
+                        onClick={runProcessing}
+                        disabled={isProcessing || !volume || (procMethod === 'hist_match' && !referenceVolume)}
+                        className="w-full py-3 bg-cyan-600 hover:bg-cyan-500 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded-lg flex items-center justify-center gap-2 transition-colors shadow-lg"
+                    >
+                        {isProcessing ? <Loader2 className="animate-spin w-4 h-4"/> : completed ? <Check className="w-4 h-4"/> : <Wand2 className="w-4 h-4" />}
+                        {isProcessing ? `Running ${progress}%` : completed ? 'Complete' : 'Run Pipeline'}
+                    </button>
+                    {isProcessing && (
+                        <button
+                            type="button"
+                            onClick={() => { cancelVolumeJob(); setIsProcessing(false); setProgress(0); }}
+                            className="w-full py-2 bg-gray-800 border border-gray-700 rounded text-xs text-red-300 hover:text-red-200"
+                        >
+                            Cancel
+                        </button>
+                    )}
+                    <div className="flex gap-2">
+                        <button
+                            type="button"
+                            onClick={onUndoVolume}
+                            disabled={!canUndoVolume || isProcessing}
+                            title="Undo last processing step (Ctrl+Z)"
+                            className="flex-1 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-gray-300 hover:text-cyan-300 disabled:text-gray-600 disabled:hover:text-gray-600 flex items-center justify-center gap-1"
+                        >
+                            <RotateCcw className="w-3 h-3" /> Undo
+                        </button>
+                        <button
+                            type="button"
+                            onClick={onResetVolume}
+                            disabled={!canResetVolume || isProcessing}
+                            title="Restore the original loaded scan"
+                            className="flex-1 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-gray-300 hover:text-cyan-300 disabled:text-gray-600 disabled:hover:text-gray-600 flex items-center justify-center gap-1"
+                        >
+                            Reset original
+                        </button>
+                    </div>
+                 </div>
             </div>
         );
     }
@@ -971,10 +699,11 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
                                 )}
                                 
                                 {segMethod === 'local_adaptive' && (
+                                    <>
                                     <div className="space-y-1">
                                         <label className="flex justify-between text-xs text-gray-400">
                                             <span>Kernel Size</span>
-                                            <span className="font-mono">{localKernel}x{localKernel}</span>
+                                            <span className="font-mono">{localKernel}×{localKernel}</span>
                                         </label>
                                         <input 
                                             type="range" 
@@ -984,6 +713,23 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
                                             className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
                                         />
                                     </div>
+                                    <div className="space-y-1">
+                                        <label className="flex justify-between text-xs text-gray-400">
+                                            <span>Offset C (% of range)</span>
+                                            <span className="font-mono">{localOffset.toFixed(1)}</span>
+                                        </label>
+                                        <input
+                                            type="range"
+                                            min="0" max="20" step="0.5"
+                                            value={localOffset}
+                                            onChange={(e) => setLocalOffset(Number(e.target.value))}
+                                            className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+                                        />
+                                    </div>
+                                    <div className="text-[10px] text-gray-500 italic leading-snug">
+                                        Gaussian-weighted local mean on each axial slice (σ = (k−1)/6). A voxel is labeled 1 if it is brighter than that mean minus C, and the neighborhood is above a volume Otsu floor so air is not filled.
+                                    </div>
+                                    </>
                                 )}
 
                                 {['otsu', 'li', 'multi_otsu'].includes(segMethod) && (
@@ -1007,6 +753,7 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
                  
                  <div className="flex flex-col gap-2 mt-auto">
                     {segMethod !== 'manual_draw' ? (
+                        <>
                         <button 
                             onClick={runSegmentation}
                             disabled={isProcessing || !volume}
@@ -1015,6 +762,16 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
                             {isProcessing ? <Loader2 className="animate-spin w-4 h-4"/> : <Play className="w-4 h-4" />}
                             {isProcessing ? `Segmenting ${progress}%` : 'Generate Masks'}
                         </button>
+                        {isProcessing && (
+                            <button
+                                type="button"
+                                onClick={() => { cancelVolumeJob(); setIsProcessing(false); setProgress(0); }}
+                                className="w-full py-2 bg-gray-800 border border-gray-700 rounded text-xs text-red-300 hover:text-red-200"
+                            >
+                                Cancel
+                            </button>
+                        )}
+                        </>
                     ) : (
                          <div className="w-full py-3 bg-gray-800 border border-gray-700 text-gray-400 rounded-lg flex items-center justify-center gap-2 text-xs">
                             <MousePointer2 className="w-3 h-3" /> Interactive Mode Active

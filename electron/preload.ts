@@ -69,10 +69,20 @@ const electronAPI = {
         return () => ipcRenderer.removeListener('menu-open-settings', callback);
     },
 
+    onMenuSetViewMode: (callback: (mode: string) => void) => {
+        const handler = (_event: unknown, mode: string) => callback(mode);
+        ipcRenderer.on('menu-set-view-mode', handler);
+        return () => ipcRenderer.removeListener('menu-set-view-mode', handler);
+    },
+
     // File association handler
     onFileOpened: (callback: (file: { name: string; path: string; data: ArrayBuffer }) => void) => {
         ipcRenderer.on('file-opened', (_, file) => callback(file));
         return () => ipcRenderer.removeAllListeners('file-opened');
+    },
+
+    takePendingOpenFile: async () => {
+        return await ipcRenderer.invoke('app:takePendingOpenFile');
     }
 };
 

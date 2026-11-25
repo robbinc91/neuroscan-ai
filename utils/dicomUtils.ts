@@ -1,4 +1,5 @@
 import { VolumeData, VolumeCoordSystem } from '../types';
+import { metadataFromDicom } from './volumeMetadata';
 // @ts-ignore — no official types
 import daikon from 'daikon';
 
@@ -212,7 +213,7 @@ export const parseDicomFiles = (buffers: ArrayBuffer[]): VolumeData | null => {
 
     const coordSystem: VolumeCoordSystem = 'LPS';
 
-    return {
+    const volume: VolumeData = {
         header: {
             datatypeCode: 16,
             dims: [3, cols, rows, depth, 1, 1, 1, 1],
@@ -227,4 +228,8 @@ export const parseDicomFiles = (buffers: ArrayBuffer[]): VolumeData | null => {
         coordSystem,
         geometryNotes: geomParts.join('; ')
     };
+    volume.metadata = metadataFromDicom(first, volume, {
+        describe: (group, element) => daikon.Dictionary?.getDescription?.(group, element)
+    });
+    return volume;
 };

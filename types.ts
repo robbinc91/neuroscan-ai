@@ -23,7 +23,7 @@ export enum ProcessingMethod {
     NonLocalMeans = 'Non-local Means'
 }
 
-export type ViewportTool = 'pan' | 'zoom' | 'wl' | 'measure' | 'brush' | 'eraser';
+export type ViewportTool = 'crosshair' | 'pan' | 'zoom' | 'wl' | 'measure' | 'brush' | 'eraser';
 
 export interface MetricData {
     name: string;
@@ -39,6 +39,48 @@ export interface ScanMetadata {
     date: string;
     dimensions: [number, number, number];
     spacing: [number, number, number];
+}
+
+export interface WindowLevel {
+    width: number;
+    center: number;
+}
+
+export interface DicomTagRow {
+    id: string;
+    name: string;
+    vr?: string;
+    value: string;
+}
+
+export interface VolumeMetadata {
+    source: 'nifti' | 'dicom' | 'unknown';
+    sourceName?: string;
+    patientId?: string;
+    patientName?: string;
+    patientSex?: string;
+    patientBirthDate?: string;
+    studyDate?: string;
+    studyTime?: string;
+    studyDescription?: string;
+    seriesDescription?: string;
+    accessionNumber?: string;
+    institution?: string;
+    protocolName?: string;
+    modality?: string;
+    seriesUid?: string;
+    seriesNumber?: string;
+    manufacturer?: string;
+    description?: string;
+    datatype?: string;
+    dimensions: [number, number, number];
+    spacingMm: [number, number, number];
+    coordSystem?: string;
+    geometryNotes?: string;
+    qformCode?: number;
+    sformCode?: number;
+    /** Flattened DICOM header (pixel data omitted). */
+    tags?: DicomTagRow[];
 }
 
 export interface SegmentationStats {
@@ -65,6 +107,7 @@ export interface VolumeData {
     coordSystem?: VolumeCoordSystem;
     /** e.g. multi-series selection, missing IOP fallback */
     geometryNotes?: string;
+    metadata?: VolumeMetadata;
 }
 
 export interface Study {

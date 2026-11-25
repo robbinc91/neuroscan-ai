@@ -1,9 +1,23 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback, useImperativeHandle, forwardRef } from 'react';
-import { ViewMode, VolumeData, ViewportHandle, ReportImages, ViewportTool } from '../types';
-import { Move, ZoomIn, Sun, Ruler, Rotate3d, Layers, Play, Pause, Maximize, Settings, Sliders, ChevronDown, ChevronUp, Ghost, PenTool, Eraser, Minimize, MousePointer2, RefreshCcw, Box } from 'lucide-react';
+import { ViewMode, VolumeData, ViewportHandle, ReportImages, ViewportTool, WindowLevel } from '../types';
+import { Move, ZoomIn, Sun, Ruler, Rotate3d, Layers, Play, Pause, Maximize, Settings, Sliders, ChevronDown, ChevronUp, Ghost, PenTool, Eraser, Minimize, MousePointer2, RefreshCcw, Box, Trash2 } from 'lucide-react';
+import { WL_PRESETS, applyWlPreset, formatWindowLevel, windowBounds, type WlPreset } from '../utils/windowLevel';
+import {
+    SliceMeasurement,
+    SliceOrientation,
+    axisLockPoint,
+    displayedSliceIndex,
+    formatLengthMm,
+    inPlaneVoxelToDisplayUv,
+    measurementLengthMm,
+    pickSliceUv,
+    sliceUvToVoxelIndex
+} from '../utils/measure';
+import { canvasToJpegDataUrl, captureWebglJpeg, pickSnapshotIndices } from '../utils/reportImages';
 
 interface ViewportProps {
     viewMode: ViewMode;
+    onViewModeChange?: (mode: ViewMode) => void;
     volume: VolumeData | null;
     segmentation?: VolumeData | null;
     tool?: ViewportTool;
@@ -17,6 +31,9 @@ interface ViewportProps {
     overlayVolume?: VolumeData | null;
     overlayOpacity?: number;
     overlayColormap?: 'grayscale' | 'hot-cold';
+    windowLevel?: WindowLevel;
+    onWindowLevelChange?: (wl: WindowLevel) => void;
+    enableSliceKeys?: boolean;
 }
 
 interface SliceViewerProps {
@@ -39,12 +56,20 @@ interface SliceViewerProps {
     overlayVolume?: VolumeData | null;
     overlayOpacity?: number;
     overlayColormap?: 'grayscale' | 'hot-cold';
+    onDoubleClickLayout?: () => void;
+    measurements?: SliceMeasurement[];
+    onCommitMeasurement?: (start: { u: number; v: number }, end: { u: number; v: number }) => void;
+    windowLevel?: WindowLevel;
+    onWindowLevelChange?: (wl: WindowLevel) => void;
+    onActivate?: () => void;
 }
 
 interface Volume3DViewerProps {
     volume: VolumeData | null;
     segmentation?: VolumeData | null;
     crosshair: { x: number, y: number, z: number };
+    onDoubleClickLayout?: () => void;
+    windowLevel?: WindowLevel;
 }
 
 interface RenderSettings {
@@ -88,7 +113,8 @@ export const generateSliceBitmap = (
     orientation: string, 
     slice: number,
     colormap: 'grayscale' | 'hot-cold' = 'grayscale',
-    opacity: number = 1.0
+    opacity: number = 1.0,
+    windowLevel?: WindowLevel
 ): HTMLCanvasElement | null => {
     if (!volume) return null;
     
@@ -99,6 +125,7 @@ export const generateSliceBitmap = (
     let width = 0, height = 0;
     let xStride = 0, yStride = 0, origin = 0;
 
+    // Axial Y is flipped so display v=0 is the high-Y edge (see sliceUvToVoxelIndex).
     if (orientation === 'Axial') {
         width = dimX;
         height = dimY;
@@ -129,9 +156,13 @@ export const generateSliceBitmap = (
     if (colormap === 'hot-cold') {
         const absMax = Math.max(Math.abs(min), Math.abs(max)) || 1;
         scale = 127 / absMax;
+    } else if (windowLevel) {
+        const { lo, hi } = windowBounds(windowLevel);
+        offset = lo;
+        scale = 255 / (hi - lo || 1);
     } else {
         const range = (max - min) || 1;
-        scale = 255 * 1.2 / range;
+        scale = 255 / range;
         offset = min;
     }
     
@@ -413,114 +444,350 @@ void main() {
 }
 `;
 
+function drawRuler(
+    ctx: CanvasRenderingContext2D,
+    start: { u: number; v: number },
+    end: { u: number; v: number },
+    label: string,
+    stroke: string
+) {
+    ctx.save();
+    ctx.strokeStyle = stroke;
+    ctx.fillStyle = stroke;
+    ctx.lineWidth = 1.25;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(start.u + 0.5, start.v + 0.5);
+    ctx.lineTo(end.u + 0.5, end.v + 0.5);
+    ctx.stroke();
+    for (const p of [start, end]) {
+        ctx.beginPath();
+        ctx.arc(p.u + 0.5, p.v + 0.5, 2.2, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    const mx = (start.u + end.u) / 2 + 4;
+    const my = (start.v + end.v) / 2 - 4;
+    ctx.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(0,0,0,0.75)';
+    ctx.strokeText(label, mx, my);
+    ctx.fillStyle = stroke;
+    ctx.fillText(label, mx, my);
+    ctx.restore();
+}
+
 const SliceViewer: React.FC<SliceViewerProps> = ({ 
     title, orientation, color, isActive, 
     volume, segmentation, 
     slice, maxSlice, onSliceChange, 
     onCrosshairChange, crosshair, 
     tool, brushSize, onDraw, 
-    colormap, opacity, overlayVolume, overlayOpacity, overlayColormap 
+    colormap, opacity, overlayVolume, overlayOpacity, overlayColormap,
+    onDoubleClickLayout, measurements, onCommitMeasurement,
+    windowLevel, onWindowLevelChange, onActivate
 }) => {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
+    const baseCanvasRef = useRef<HTMLCanvasElement | null>(null);
     const [isDragging, setIsDragging] = useState(false);
+    const [draft, setDraft] = useState<{ start: { u: number; v: number }; end: { u: number; v: number } } | null>(null);
+    const draftRef = useRef<{ start: { u: number; v: number }; end: { u: number; v: number } } | null>(null);
+
+    useEffect(() => {
+        if (!volume) {
+            baseCanvasRef.current = null;
+            return;
+        }
+        const baseBitmap = generateSliceBitmap(volume, segmentation, orientation, slice, colormap, opacity, windowLevel);
+        if (!baseBitmap) {
+            baseCanvasRef.current = null;
+            return;
+        }
+        if (overlayVolume) {
+            const overlayBitmap = generateSliceBitmap(
+                overlayVolume, null, orientation, slice, overlayColormap || 'hot-cold', overlayOpacity,
+                overlayColormap === 'grayscale' ? windowLevel : undefined
+            );
+            if (overlayBitmap) {
+                const bctx = baseBitmap.getContext('2d');
+                if (bctx) {
+                    bctx.globalAlpha = overlayOpacity || 0.5;
+                    bctx.drawImage(overlayBitmap, 0, 0);
+                    bctx.globalAlpha = 1.0;
+                }
+            }
+        }
+        baseCanvasRef.current = baseBitmap;
+    }, [volume, segmentation, orientation, slice, colormap, opacity, overlayVolume, overlayOpacity, overlayColormap, windowLevel]);
 
     useEffect(() => {
         const canvas = canvasRef.current;
-        if (!canvas || !volume) return;
+        const base = baseCanvasRef.current;
+        if (!canvas || !volume || !base) return;
         const ctx = canvas.getContext('2d');
         if (!ctx) return;
-        
-        const baseBitmap = generateSliceBitmap(volume, segmentation, orientation, slice, colormap, opacity);
-        let overlayBitmap = null;
-        if (overlayVolume) {
-             overlayBitmap = generateSliceBitmap(overlayVolume, null, orientation, slice, overlayColormap || 'hot-cold', overlayOpacity);
+
+        if (canvas.width !== base.width || canvas.height !== base.height) {
+            canvas.width = base.width;
+            canvas.height = base.height;
+        }
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(base, 0, 0);
+
+        if (isActive && tool !== 'measure') {
+            const disp = inPlaneVoxelToDisplayUv(orientation, crosshair.x, crosshair.y, volume.dimensions);
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 0.5;
+            ctx.beginPath();
+            ctx.moveTo(disp.u + 0.5, 0);
+            ctx.lineTo(disp.u + 0.5, canvas.height);
+            ctx.moveTo(0, disp.v + 0.5);
+            ctx.lineTo(canvas.width, disp.v + 0.5);
+            ctx.stroke();
         }
 
-        if (baseBitmap) {
-            canvas.width = baseBitmap.width;
-            canvas.height = baseBitmap.height;
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            ctx.drawImage(baseBitmap, 0, 0);
-
-            if (overlayBitmap) {
-                 ctx.globalAlpha = overlayOpacity || 0.5;
-                 ctx.drawImage(overlayBitmap, 0, 0);
-                 ctx.globalAlpha = 1.0;
-            }
-
-            if (isActive) {
-                ctx.strokeStyle = color;
-                ctx.lineWidth = 0.5;
-                ctx.beginPath();
-                ctx.moveTo(crosshair.x + 0.5, 0);
-                ctx.lineTo(crosshair.x + 0.5, canvas.height);
-                ctx.moveTo(0, crosshair.y + 0.5);
-                ctx.lineTo(canvas.width, crosshair.y + 0.5);
-                ctx.stroke();
-            }
+        const sliceIdx = displayedSliceIndex(slice);
+        const visible = (measurements ?? []).filter(
+            (m) => m.orientation === orientation && m.slice === sliceIdx
+        );
+        for (const m of visible) {
+            const mm = measurementLengthMm(volume, orientation, sliceIdx, m.start, m.end);
+            drawRuler(ctx, m.start, m.end, formatLengthMm(mm), '#22d3ee');
         }
-    }, [volume, segmentation, orientation, slice, colormap, opacity, overlayVolume, overlayOpacity, crosshair, isActive, color]);
+        if (draft) {
+            const mm = measurementLengthMm(volume, orientation, sliceIdx, draft.start, draft.end);
+            drawRuler(ctx, draft.start, draft.end, formatLengthMm(mm), '#fde047');
+        }
+    }, [volume, orientation, slice, crosshair, isActive, color, tool, measurements, draft, segmentation, colormap, opacity, overlayVolume, overlayOpacity, overlayColormap, windowLevel]);
 
-    const handleMouseDown = (e: React.MouseEvent) => { setIsDragging(true); handleMouseMove(e); };
-    const handleMouseUp = () => setIsDragging(false);
+    useEffect(() => {
+        if (tool !== 'measure') {
+            draftRef.current = null;
+            setDraft(null);
+        }
+    }, [tool]);
+
+    const cancelMeasure = () => {
+        draftRef.current = null;
+        setDraft(null);
+        setIsDragging(false);
+    };
+
+    useEffect(() => {
+        if (!draft) return;
+        const onKey = (e: KeyboardEvent) => {
+            if (e.key === 'Escape') cancelMeasure();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+    }, [draft]);
+
+    const hitFromEvent = (e: { clientX: number; clientY: number }, clamp = false) => {
+        const canvas = canvasRef.current;
+        if (!canvas || !volume) return null;
+        return pickSliceUv(canvas, e.clientX, e.clientY, { clamp });
+    };
+
+    const emitCrosshairFromDisplay = (u: number, v: number) => {
+        if (!volume) return;
+        const [vx, vy, vz] = sliceUvToVoxelIndex(orientation, u, v, slice, volume.dimensions);
+        if (orientation === 'Axial') onCrosshairChange(vx, vy);
+        else if (orientation === 'Coronal') onCrosshairChange(vx, vz);
+        else onCrosshairChange(vy, vz);
+    };
+
+    const finishMeasure = (e?: { clientX: number; clientY: number; shiftKey?: boolean }) => {
+        const current = draftRef.current;
+        if (!current) {
+            setIsDragging(false);
+            return;
+        }
+        const rawEnd = e ? hitFromEvent(e, true) ?? current.end : current.end;
+        const end = axisLockPoint(current.start, rawEnd, !!e?.shiftKey);
+        const dx = end.u - current.start.u;
+        const dy = end.v - current.start.v;
+        draftRef.current = null;
+        setDraft(null);
+        setIsDragging(false);
+        if (dx * dx + dy * dy >= 1) {
+            onCommitMeasurement?.(current.start, end);
+        }
+    };
+
+    const wlDragRef = useRef<{
+        x: number;
+        y: number;
+        width: number;
+        center: number;
+        moved: boolean;
+    } | null>(null);
+
+    const startWlDrag = (e: React.PointerEvent<HTMLCanvasElement>) => {
+        if (!windowLevel || !onWindowLevelChange) return false;
+        e.preventDefault();
+        e.currentTarget.setPointerCapture(e.pointerId);
+        wlDragRef.current = {
+            x: e.clientX,
+            y: e.clientY,
+            width: windowLevel.width,
+            center: windowLevel.center,
+            moved: false
+        };
+        return true;
+    };
+
+    const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+        onActivate?.();
+        const rightOrMiddle = e.button === 2 || e.button === 1;
+        if (tool !== 'measure' && rightOrMiddle && startWlDrag(e)) return;
+        if (tool === 'wl' && e.button === 0 && startWlDrag(e)) return;
+        if (tool !== 'measure') return;
+        if (e.button === 2) {
+            e.preventDefault();
+            cancelMeasure();
+            return;
+        }
+        if (e.button !== 0) return;
+        const hit = hitFromEvent(e);
+        if (!hit) return;
+        e.preventDefault();
+        e.currentTarget.setPointerCapture(e.pointerId);
+        const next = { start: hit, end: hit };
+        draftRef.current = next;
+        setDraft(next);
+        setIsDragging(true);
+    };
+
+    const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+        const wlDrag = wlDragRef.current;
+        if (wlDrag && windowLevel && onWindowLevelChange && volume) {
+            const dx = e.clientX - wlDrag.x;
+            const dy = e.clientY - wlDrag.y;
+            if (Math.abs(dx) + Math.abs(dy) <= 4) return;
+            wlDrag.moved = true;
+            const span = Math.max(1e-3, volume.max - volume.min);
+            const k = Math.max(span / 500, wlDrag.width / 400);
+            onWindowLevelChange({
+                width: Math.max(1e-3, wlDrag.width + dx * k * 1.4),
+                center: wlDrag.center - dy * k
+            });
+            return;
+        }
+        if (tool !== 'measure') return;
+        const prev = draftRef.current;
+        if (!prev) return;
+        const hit = hitFromEvent(e, true);
+        if (!hit) return;
+        const end = axisLockPoint(prev.start, hit, e.shiftKey);
+        const next = { start: prev.start, end };
+        draftRef.current = next;
+        setDraft(next);
+    };
+
+    const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
+        const wlDrag = wlDragRef.current;
+        if (wlDrag) {
+            if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+                e.currentTarget.releasePointerCapture(e.pointerId);
+            }
+            if (!wlDrag.moved && e.button === 0) {
+                const hit = hitFromEvent(e);
+                if (hit) emitCrosshairFromDisplay(hit.u, hit.v);
+            }
+            wlDragRef.current = null;
+            return;
+        }
+        if (tool !== 'measure') return;
+        if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+            e.currentTarget.releasePointerCapture(e.pointerId);
+        }
+        finishMeasure(e);
+    };
+
+    const handleMouseDown = (e: React.MouseEvent) => {
+        if (e.button !== 0) return;
+        if (tool === 'measure' || tool === 'wl') return;
+        onActivate?.();
+        setIsDragging(true);
+        handleMouseMove(e);
+    };
+
+    const handleMouseUp = () => {
+        if (tool === 'measure') return;
+        setIsDragging(false);
+    };
     
     const handleMouseMove = (e: React.MouseEvent) => {
+        if (tool === 'measure') return;
         if (!isDragging && e.buttons !== 1) return;
-        const rect = canvasRef.current?.getBoundingClientRect();
-        if (!rect || !volume) return;
-
-        const x = (e.clientX - rect.left) / rect.width;
-        const y = (e.clientY - rect.top) / rect.height;
-        
-        let imgW = 0, imgH = 0;
-        if (orientation === 'Axial') { imgW = volume.dimensions[0]; imgH = volume.dimensions[1]; }
-        if (orientation === 'Coronal') { imgW = volume.dimensions[0]; imgH = volume.dimensions[2]; }
-        if (orientation === 'Sagittal') { imgW = volume.dimensions[1]; imgH = volume.dimensions[2]; }
-
-        const u = Math.max(0, Math.min(imgW - 1, Math.floor(x * imgW)));
-        const v = Math.max(0, Math.min(imgH - 1, Math.floor(y * imgH)));
+        const hit = hitFromEvent(e);
+        if (!hit || !volume) return;
+        const [vx, vy, vz] = sliceUvToVoxelIndex(orientation, hit.u, hit.v, slice, volume.dimensions);
 
         if (tool === 'brush' || tool === 'eraser') {
-            if (onDraw) {
-                let vx=0, vy=0, vz=0;
-                if (orientation === 'Axial') { vx=u; vy=v; vz=slice; }
-                if (orientation === 'Coronal') { vx=u; vy=slice; vz=v; }
-                if (orientation === 'Sagittal') { vx=slice; vy=u; vz=v; } 
-                onDraw(vx, vy, vz, tool === 'brush' ? 1 : 0, brushSize);
-            }
+            onDraw?.(vx, vy, vz, tool === 'brush' ? 1 : 0, brushSize);
         } else {
-            onCrosshairChange(u, v);
+            emitCrosshairFromDisplay(hit.u, hit.v);
         }
     };
 
     const handleWheel = (e: React.WheelEvent) => {
+        if (draft) return;
+        e.preventDefault();
         if (e.deltaY !== 0) {
-            const delta = e.deltaY > 0 ? 1 : -1;
+            const step = e.shiftKey ? 10 : 1;
+            const delta = e.deltaY > 0 ? step : -step;
             const newSlice = Math.max(0, Math.min(maxSlice - 1, slice + delta));
             onSliceChange(newSlice);
         }
     };
 
     return (
-        <div ref={containerRef} className={`relative w-full h-full bg-black border-2 ${isActive ? `border-[${color}]` : 'border-gray-800'} overflow-hidden flex flex-col`}>
-             <div className="absolute top-2 left-2 text-xs font-bold" style={{ color }}>
+        <div
+            ref={containerRef}
+            className={`relative w-full h-full bg-black border-2 ${isActive ? `border-[${color}]` : 'border-gray-800'} overflow-hidden flex flex-col`}
+            onMouseEnter={onActivate}
+        >
+             <div className="absolute top-2 left-2 text-xs font-bold pointer-events-none" style={{ color }}>
                 {title} <span className="text-gray-500 font-mono">[{slice + 1}/{maxSlice}]</span>
             </div>
+            {tool === 'measure' && volume && (
+                <div className="absolute top-2 right-2 text-[10px] font-mono text-cyan-300/90 pointer-events-none">
+                    {draft
+                        ? formatLengthMm(measurementLengthMm(volume, orientation, displayedSliceIndex(slice), draft.start, draft.end))
+                        : 'Drag · Shift axis-lock'}
+                </div>
+            )}
             <canvas 
                 ref={canvasRef}
-                className="w-full h-full object-contain touch-none cursor-crosshair"
+                className={`w-full h-full object-contain touch-none ${tool === 'measure' || tool === 'crosshair' ? 'cursor-crosshair' : tool === 'wl' ? 'cursor-ns-resize' : 'cursor-default'}`}
+                onPointerDown={handlePointerDown}
+                onPointerMove={handlePointerMove}
+                onPointerUp={handlePointerUp}
+                onPointerCancel={handlePointerUp}
+                onContextMenu={(e) => {
+                    e.preventDefault();
+                    if (tool === 'measure') cancelMeasure();
+                }}
                 onMouseDown={handleMouseDown}
                 onMouseMove={handleMouseMove}
                 onMouseUp={handleMouseUp}
-                onMouseLeave={handleMouseUp}
+                onMouseLeave={() => handleMouseUp()}
                 onWheel={handleWheel}
+                onDoubleClick={tool === 'measure' ? undefined : onDoubleClickLayout}
+                title={
+                    tool === 'measure'
+                        ? 'Drag to measure (patient mm). Shift locks to an axis.'
+                        : tool === 'wl'
+                            ? 'Drag: window/level. Click: crosshair. Wheel: slice (Shift = ×10).'
+                            : 'Click/drag: crosshair. Right-drag: W/L. Wheel: slice. Double-click: expand.'
+                }
             />
         </div>
     );
 };
 
-const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerProps>(({ volume, segmentation, crosshair }, ref) => {
+const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerProps>(({ volume, segmentation, crosshair, onDoubleClickLayout, windowLevel }, ref) => {
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
     const setCanvasRef = useCallback(
         (el: HTMLCanvasElement | null) => {
@@ -558,6 +825,8 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
         opacity: 0.8
     });
     const settingsRef = useRef<RenderSettings>({ mode: 0, threshold: 40, opacity: 0.8 });
+    const wlRef = useRef<WindowLevel | undefined>(windowLevel);
+    wlRef.current = windowLevel;
     const [windowing, setWindowing] = useState({ p10: 40, p35: 100, p60: 150 });
 
     const isDraggingRef = useRef(false);
@@ -743,7 +1012,13 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
             gl.uniformMatrix4fv(gl.getUniformLocation(prog, 'u_invViewRot'), false, new Float32Array(invViewRot));
             gl.uniform3f(gl.getUniformLocation(prog, 'u_dims'), dimX, dimY, dimZ);
             gl.uniform3f(gl.getUniformLocation(prog, 'u_boxSize'), boxSize[0], boxSize[1], boxSize[2]);
-            gl.uniform2f(gl.getUniformLocation(prog, 'u_dataRange'), volume.min, volume.max);
+            const wl = wlRef.current;
+            if (wl) {
+                const { lo, hi } = windowBounds(wl);
+                gl.uniform2f(gl.getUniformLocation(prog, 'u_dataRange'), lo, hi);
+            } else {
+                gl.uniform2f(gl.getUniformLocation(prog, 'u_dataRange'), volume.min, volume.max);
+            }
             gl.uniform1f(gl.getUniformLocation(prog, 'u_zoom'), zoomRef.current);
             gl.uniform2f(gl.getUniformLocation(prog, 'u_pan'), panRef.current.x, panRef.current.y);
             gl.uniform1f(gl.getUniformLocation(prog, 'u_opacity'), settingsRef.current.opacity);
@@ -905,7 +1180,8 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
         <div 
             ref={containerRef} 
             onMouseDown={handleMouseDown} 
-            onWheel={handleWheel} 
+            onWheel={handleWheel}
+            onDoubleClick={onDoubleClickLayout}
             onContextMenu={(e) => e.preventDefault()}
             className={`relative h-full w-full bg-black border-2 border-gray-800 overflow-hidden group select-none touch-none ${cursorClass}`}
         >
@@ -993,13 +1269,85 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
 
 export const Viewport = forwardRef<ViewportHandle, ViewportProps>((props, ref) => {
     const { 
-        viewMode, volume, segmentation, tool, onToolChange, brushSize, onUpdateSegmentation,
+        viewMode, onViewModeChange, volume, segmentation, tool, onToolChange, brushSize, onUpdateSegmentation,
         position, onPositionChange,
-        colormap, opacity, overlayVolume, overlayOpacity, overlayColormap
+        colormap, opacity, overlayVolume, overlayOpacity, overlayColormap,
+        windowLevel, onWindowLevelChange, enableSliceKeys = true
     } = props;
+
+    const toggleLayout = (target: ViewMode) => {
+        if (!onViewModeChange) return;
+        onViewModeChange(viewMode === target ? ViewMode.FourUp : target);
+    };
     
     const [localPos, setLocalPos] = useState({ x: 0, y: 0, z: 0 });
+    const [measurements, setMeasurements] = useState<SliceMeasurement[]>([]);
+    const [focusPlane, setFocusPlane] = useState<SliceOrientation>('Axial');
+    const measureIdRef = useRef(1);
     const pos = position || localPos;
+    const gridKey = `${volume?.dimensions.join('x')}|${(volume?.affine ?? []).slice(0, 12).join(',')}`;
+
+    useEffect(() => {
+        setMeasurements([]);
+        measureIdRef.current = 1;
+    }, [gridKey]);
+
+    useEffect(() => {
+        const onKey = (e: KeyboardEvent) => {
+            const target = e.target as HTMLElement | null;
+            if (target) {
+                const tag = target.tagName;
+                if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable) return;
+            }
+            if (e.key === 'Backspace' || e.key === 'Delete') {
+                if (tool !== 'measure') return;
+                e.preventDefault();
+                setMeasurements((prev) => prev.slice(0, -1));
+                return;
+            }
+            if (!enableSliceKeys || !volume) return;
+            const [dimX, dimY, dimZ] = volume.dimensions;
+            const plane: SliceOrientation =
+                viewMode === ViewMode.Axial ? 'Axial'
+                : viewMode === ViewMode.Coronal ? 'Coronal'
+                : viewMode === ViewMode.Sagittal ? 'Sagittal'
+                : focusPlane;
+            const axis = plane === 'Axial' ? 'z' : plane === 'Coronal' ? 'y' : 'x';
+            const max = axis === 'z' ? dimZ : axis === 'y' ? dimY : dimX;
+            const step = e.shiftKey ? 10 : 1;
+            let delta = 0;
+            if (e.key === 'ArrowUp' || e.key === 'PageUp' || e.key === ',' || e.key === '<') delta = -step;
+            else if (e.key === 'ArrowDown' || e.key === 'PageDown' || e.key === '.' || e.key === '>') delta = step;
+            else if (e.key === 'Home') {
+                e.preventDefault();
+                handlePosChange({ ...pos, [axis]: 0 });
+                return;
+            } else if (e.key === 'End') {
+                e.preventDefault();
+                handlePosChange({ ...pos, [axis]: max - 1 });
+                return;
+            }
+            if (!delta) return;
+            e.preventDefault();
+            const cur = axis === 'z' ? pos.z : axis === 'y' ? pos.y : pos.x;
+            const next = Math.max(0, Math.min(max - 1, cur + delta));
+            handlePosChange({ ...pos, [axis]: next });
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+    }, [tool, volume, viewMode, focusPlane, pos, enableSliceKeys]);
+
+    const commitMeasurement = (
+        orientation: SliceOrientation,
+        slice: number,
+        start: { u: number; v: number },
+        end: { u: number; v: number }
+    ) => {
+        setMeasurements((prev) => [
+            ...prev,
+            { id: measureIdRef.current++, orientation, slice: displayedSliceIndex(slice), start, end }
+        ]);
+    };
     
     const handlePosChange = (p: {x:number, y:number, z:number}) => {
         if (onPositionChange) onPositionChange(p);
@@ -1045,21 +1393,39 @@ export const Viewport = forwardRef<ViewportHandle, ViewportProps>((props, ref) =
         
     }, [volume, segmentation, onUpdateSegmentation]);
 
-    useImperativeHandle(ref, () => ({
-        getReportImages: async () => {
-             if (!volume) return { axial: [], coronal: [], sagittal: [], threeD: [] };
-             
-             // Capture logic simplified for brevity - assumes canvas refs would be exposed or managed differently in production
-             // Here we just return empty or logic to capture from DOM if needed. 
-             // Since we need to return images for report, let's grab the 3D one if available.
-             let threeD = "";
-             if (canvas3DRef.current) {
-                 threeD = canvas3DRef.current.toDataURL('image/jpeg', 0.8);
-             }
-             
-             return { axial: [], coronal: [], sagittal: [], threeD: [threeD] };
+    const capturePlane = (orientation: SliceOrientation, sliceIndices: number[]): string[] => {
+        if (!volume) return [];
+        const urls: string[] = [];
+        for (const idx of sliceIndices) {
+            const bmp = generateSliceBitmap(
+                volume,
+                segmentation ?? null,
+                orientation,
+                idx,
+                colormap || 'grayscale',
+                opacity ?? 1,
+                windowLevel
+            );
+            if (!bmp) continue;
+            const url = canvasToJpegDataUrl(bmp);
+            if (url) urls.push(url);
         }
-    }));
+        return urls;
+    };
+
+    useImperativeHandle(ref, () => ({
+        getReportImages: async (): Promise<ReportImages> => {
+            if (!volume) return { axial: [], coronal: [], sagittal: [], threeD: [] };
+            const [dimX, dimY, dimZ] = volume.dimensions;
+            const three = captureWebglJpeg(canvas3DRef.current);
+            return {
+                axial: capturePlane('Axial', pickSnapshotIndices(dimZ, pos.z)),
+                coronal: capturePlane('Coronal', pickSnapshotIndices(dimY, pos.y)),
+                sagittal: capturePlane('Sagittal', pickSnapshotIndices(dimX, pos.x)),
+                threeD: three ? [three] : []
+            };
+        }
+    }), [volume, segmentation, pos, colormap, opacity, windowLevel]);
 
     if (!volume) return <div className="flex items-center justify-center h-full text-gray-600">No Volume Loaded</div>;
 
@@ -1073,10 +1439,16 @@ export const Viewport = forwardRef<ViewportHandle, ViewportProps>((props, ref) =
             onSliceChange={(s) => handlePosChange({...pos, z: s})}
             onCrosshairChange={(u,v) => handlePosChange({...pos, x: u, y: v})}
             crosshair={{x: pos.x, y: pos.y}}
-            tool={tool || 'wl'} brushSize={brushSize || 5}
+            tool={tool || 'crosshair'} brushSize={brushSize || 5}
             onDraw={handleDraw}
             colormap={colormap} opacity={opacity}
             overlayVolume={overlayVolume} overlayOpacity={overlayOpacity} overlayColormap={overlayColormap}
+            onDoubleClickLayout={() => toggleLayout(ViewMode.Axial)}
+            measurements={measurements}
+            onCommitMeasurement={(start, end) => commitMeasurement('Axial', pos.z, start, end)}
+            windowLevel={windowLevel}
+            onWindowLevelChange={onWindowLevelChange}
+            onActivate={() => setFocusPlane('Axial')}
         />
     );
 
@@ -1088,10 +1460,16 @@ export const Viewport = forwardRef<ViewportHandle, ViewportProps>((props, ref) =
             onSliceChange={(s) => handlePosChange({...pos, y: s})}
             onCrosshairChange={(u,v) => handlePosChange({...pos, x: u, z: v})}
             crosshair={{x: pos.x, y: pos.z}}
-            tool={tool || 'wl'} brushSize={brushSize || 5}
+            tool={tool || 'crosshair'} brushSize={brushSize || 5}
             onDraw={handleDraw}
             colormap={colormap} opacity={opacity}
             overlayVolume={overlayVolume} overlayOpacity={overlayOpacity} overlayColormap={overlayColormap}
+            onDoubleClickLayout={() => toggleLayout(ViewMode.Coronal)}
+            measurements={measurements}
+            onCommitMeasurement={(start, end) => commitMeasurement('Coronal', pos.y, start, end)}
+            windowLevel={windowLevel}
+            onWindowLevelChange={onWindowLevelChange}
+            onActivate={() => setFocusPlane('Coronal')}
         />
     );
 
@@ -1103,10 +1481,16 @@ export const Viewport = forwardRef<ViewportHandle, ViewportProps>((props, ref) =
             onSliceChange={(s) => handlePosChange({...pos, x: s})}
             onCrosshairChange={(u,v) => handlePosChange({...pos, y: u, z: v})} 
             crosshair={{x: pos.y, y: pos.z}}
-            tool={tool || 'wl'} brushSize={brushSize || 5}
+            tool={tool || 'crosshair'} brushSize={brushSize || 5}
             onDraw={handleDraw}
             colormap={colormap} opacity={opacity}
             overlayVolume={overlayVolume} overlayOpacity={overlayOpacity} overlayColormap={overlayColormap}
+            onDoubleClickLayout={() => toggleLayout(ViewMode.Sagittal)}
+            measurements={measurements}
+            onCommitMeasurement={(start, end) => commitMeasurement('Sagittal', pos.x, start, end)}
+            windowLevel={windowLevel}
+            onWindowLevelChange={onWindowLevelChange}
+            onActivate={() => setFocusPlane('Sagittal')}
         />
     );
     
@@ -1115,16 +1499,124 @@ export const Viewport = forwardRef<ViewportHandle, ViewportProps>((props, ref) =
             ref={canvas3DRef}
             volume={volume} 
             segmentation={segmentation} 
-            crosshair={pos} 
+            crosshair={pos}
+            onDoubleClickLayout={() => toggleLayout(ViewMode.ThreeD)}
+            windowLevel={windowLevel}
         />
     );
 
-    if (viewMode === ViewMode.Axial) return <div className="w-full h-full">{renderAxial()}</div>;
-    if (viewMode === ViewMode.Coronal) return <div className="w-full h-full">{renderCoronal()}</div>;
-    if (viewMode === ViewMode.Sagittal) return <div className="w-full h-full">{renderSagittal()}</div>;
-    if (viewMode === ViewMode.ThreeD) return <div className="w-full h-full">{render3D()}</div>;
+    const toolBtn = (id: ViewportTool, label: string, Icon: typeof Sun) => {
+        const active = (tool || 'crosshair') === id;
+        return (
+            <button
+                type="button"
+                onClick={() => onToolChange?.(id)}
+                title={
+                    id === 'crosshair'
+                        ? 'Crosshair (C) — click or drag to navigate slices'
+                        : id === 'measure'
+                            ? 'Measure (M/R) — drag on a 2D slice, Shift to axis-lock'
+                            : `${label} (W) — drag to window/level`
+                }
+                className={`flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium uppercase tracking-wide transition-colors ${
+                    active ? 'bg-cyan-900/70 text-cyan-300' : 'text-gray-400 hover:text-gray-200 hover:bg-gray-700/80'
+                }`}
+            >
+                <Icon className="w-3.5 h-3.5" />
+                {label}
+            </button>
+        );
+    };
 
-    return (
+    const wrap = (inner: React.ReactNode) => (
+        <div className="relative w-full h-full min-h-0">
+            {onToolChange && (
+                <div className="absolute top-2 left-1/2 -translate-x-1/2 z-30 flex items-center gap-0.5 rounded-lg border border-gray-700 bg-gray-900/90 p-0.5 shadow-lg">
+                    {toolBtn('crosshair', 'Crosshair', MousePointer2)}
+                    {toolBtn('wl', 'W/L', Sun)}
+                    {toolBtn('measure', 'Measure', Ruler)}
+                    {windowLevel && onWindowLevelChange && volume && (
+                        <>
+                            <div className="mx-0.5 h-4 w-px bg-gray-700" />
+                            <select
+                                aria-label="Window/level preset"
+                                key={gridKey}
+                                defaultValue="auto"
+                                onChange={(e) => {
+                                    const preset = WL_PRESETS.find((p) => p.id === e.target.value);
+                                    if (preset) onWindowLevelChange(applyWlPreset(volume, preset));
+                                }}
+                                className="bg-transparent text-[10px] uppercase tracking-wide text-gray-300 px-1 py-1 outline-none cursor-pointer"
+                            >
+                                {WL_PRESETS.map((preset: WlPreset) => (
+                                    <option key={preset.id} value={preset.id} className="bg-gray-900">
+                                        {preset.label}
+                                    </option>
+                                ))}
+                            </select>
+                            <span className="px-1.5 font-mono text-[10px] text-gray-500 whitespace-nowrap">
+                                {formatWindowLevel(windowLevel)}
+                            </span>
+                        </>
+                    )}
+                    {measurements.length > 0 && (
+                        <button
+                            type="button"
+                            onClick={() => setMeasurements([])}
+                            title="Clear all measurements"
+                            className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium uppercase tracking-wide text-gray-400 hover:text-red-300 hover:bg-gray-700/80"
+                        >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            Clear
+                        </button>
+                    )}
+                </div>
+            )}
+            {inner}
+            {volume && measurements.length > 0 && (
+                <div className="absolute bottom-2 left-2 z-20 min-w-[160px] max-w-[240px] rounded-md border border-gray-700 bg-black/80 p-1.5 shadow-lg">
+                    <div className="mb-1 text-[9px] uppercase tracking-wide text-gray-500">Measurements</div>
+                    <div className="space-y-0.5">
+                        {measurements.slice(-8).map((m) => {
+                            const mm = measurementLengthMm(volume, m.orientation, m.slice, m.start, m.end);
+                            const short = m.orientation.slice(0, 3);
+                            return (
+                                <button
+                                    key={m.id}
+                                    type="button"
+                                    title={`Go to ${m.orientation} slice ${m.slice + 1}`}
+                                    onClick={() => {
+                                        if (m.orientation === 'Axial') handlePosChange({ ...pos, z: m.slice });
+                                        else if (m.orientation === 'Coronal') handlePosChange({ ...pos, y: m.slice });
+                                        else handlePosChange({ ...pos, x: m.slice });
+                                    }}
+                                    className="flex w-full items-center justify-between gap-3 rounded px-1 py-0.5 text-left font-mono text-[10px] text-cyan-200 hover:bg-gray-800"
+                                >
+                                    <span className="text-gray-400">{short} {m.slice + 1}</span>
+                                    <span>{formatLengthMm(mm)}</span>
+                                </button>
+                            );
+                        })}
+                    </div>
+                    {measurements.length > 8 && (
+                        <div className="mt-1 text-[9px] text-gray-500">{measurements.length - 8} earlier hidden</div>
+                    )}
+                </div>
+            )}
+            {(tool || 'crosshair') === 'measure' && viewMode === ViewMode.ThreeD && (
+                <div className="absolute bottom-8 left-1/2 -translate-x-1/2 z-20 text-[11px] text-cyan-300 bg-black/70 px-2 py-1 rounded pointer-events-none">
+                    Switch to Axial, Coronal, or Sagittal to measure
+                </div>
+            )}
+        </div>
+    );
+
+    if (viewMode === ViewMode.Axial) return wrap(<div className="w-full h-full">{renderAxial()}</div>);
+    if (viewMode === ViewMode.Coronal) return wrap(<div className="w-full h-full">{renderCoronal()}</div>);
+    if (viewMode === ViewMode.Sagittal) return wrap(<div className="w-full h-full">{renderSagittal()}</div>);
+    if (viewMode === ViewMode.ThreeD) return wrap(<div className="w-full h-full">{render3D()}</div>);
+
+    return wrap(
         <div className="grid grid-cols-2 grid-rows-2 h-full w-full bg-black gap-0.5">
             {renderAxial()}
             {renderCoronal()}

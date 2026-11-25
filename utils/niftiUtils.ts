@@ -1,6 +1,54 @@
 import * as nifti from 'nifti-reader-js';
 import { VolumeData, VolumeCoordSystem } from '../types';
 import { flattenAffineFromNiftiMat } from './mat4';
+import { metadataFromNifti } from './volumeMetadata';
+
+type NiftiNumericArray = Float32Array | Int16Array | Uint8Array | Int32Array | Float64Array | Uint16Array;
+
+function applyNiftiIntensityScale(
+    header: { scl_slope?: number; scl_inter?: number },
+    typedData: NiftiNumericArray
+): { data: NiftiNumericArray; min: number; max: number; scaled: boolean } {
+    const slope = header.scl_slope;
+    const intercept = header.scl_inter ?? 0;
+    // NIfTI: scl_slope of 0 means "do not scale".
+    const scaled =
+        Number.isFinite(slope) &&
+        slope !== 0 &&
+        (slope !== 1 || intercept !== 0);
+
+    let min = Infinity;
+    let max = -Infinity;
+    if (scaled) {
+        const out = new Float32Array(typedData.length);
+        const s = slope as number;
+        for (let i = 0; i < typedData.length; i++) {
+            const val = typedData[i] * s + intercept;
+            out[i] = val;
+            if (Number.isFinite(val)) {
+                if (val < min) min = val;
+                if (val > max) max = val;
+            }
+        }
+        if (!Number.isFinite(min) || !Number.isFinite(max)) {
+            min = 0;
+            max = 1;
+        }
+        return { data: out, min, max, scaled: true };
+    }
+
+    for (let i = 0; i < typedData.length; i++) {
+        const val = typedData[i];
+        if (!Number.isFinite(val)) continue;
+        if (val < min) min = val;
+        if (val > max) max = val;
+    }
+    if (!Number.isFinite(min) || !Number.isFinite(max)) {
+        min = 0;
+        max = 1;
+    }
+    return { data: typedData, min, max, scaled: false };
+}
 
 function coordSystemFromNiftiHeader(header: { qform_code?: number; sform_code?: number }): VolumeCoordSystem {
     const q = header.qform_code ?? 0;
@@ -55,24 +103,23 @@ export const parseNiftiFile = (arrayBuffer: ArrayBuffer): VolumeData | null => {
             typedData = new Uint8Array(image);
     }
 
-    let min = Infinity;
-    let max = -Infinity;
-    for (let i = 0; i < typedData.length; i += 10) {
-        const val = typedData[i];
-        if (val < min) min = val;
-        if (val > max) max = val;
-    }
+    const { data: scaledData, min, max, scaled } = applyNiftiIntensityScale(header, typedData);
 
     const affine = flattenAffineFromNiftiMat(header.affine);
     const coordSystem = coordSystemFromNiftiHeader(header);
-    const geomNote =
+    const geomNoteParts = [
         header.qform_code > 0 || header.sform_code > 0
             ? `nifti:qform=${header.qform_code};sform=${header.sform_code}`
-            : 'nifti:affine_fallback_pixdim_only';
+            : 'nifti:affine_fallback_pixdim_only'
+    ];
+    if (scaled) {
+        geomNoteParts.push(`scl_slope=${header.scl_slope};scl_inter=${header.scl_inter}`);
+    }
+    const geomNote = geomNoteParts.join(';');
 
-    return {
+    const volume: VolumeData = {
         header,
-        data: typedData,
+        data: scaledData,
         dimensions: [header.dims[1], header.dims[2], header.dims[3]],
         min,
         max,
@@ -80,4 +127,6 @@ export const parseNiftiFile = (arrayBuffer: ArrayBuffer): VolumeData | null => {
         coordSystem,
         geometryNotes: geomNote
     };
+    volume.metadata = metadataFromNifti(volume);
+    return volume;
 };

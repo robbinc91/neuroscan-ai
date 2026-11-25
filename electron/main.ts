@@ -14,6 +14,64 @@ const store = new Store({
 
 let mainWindow: BrowserWindow | null = null;
 
+type OpenedFilePayload = { name: string; path: string; data: ArrayBuffer };
+
+let pendingOpenFile: OpenedFilePayload | null = null;
+let rendererReady = false;
+let queuedOpenPath: string | null = null;
+
+function isMedicalImagePath(filePath: string): boolean {
+    const lower = filePath.toLowerCase();
+    return (
+        lower.endsWith('.nii') ||
+        lower.endsWith('.nii.gz') ||
+        lower.endsWith('.dcm') ||
+        lower.endsWith('.ima') ||
+        lower.endsWith('.dicom')
+    );
+}
+
+function filePathFromArgv(argv: string[]): string | undefined {
+    for (const arg of argv) {
+        if (!arg || arg.startsWith('-')) continue;
+        if (arg === '.') continue;
+        if (/\.(exe|app|asar)$/i.test(arg)) continue;
+        if (arg.toLowerCase().includes('electron')) continue;
+        if (isMedicalImagePath(arg)) return arg;
+    }
+    return undefined;
+}
+
+async function readOpenedFile(filePath: string): Promise<OpenedFilePayload> {
+    const buffer = await readFile(filePath);
+    return {
+        name: filePath.split(/[\\/]/).pop() || 'unknown',
+        path: filePath,
+        data: buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
+    };
+}
+
+function deliverOpenedFile(payload: OpenedFilePayload) {
+    pendingOpenFile = payload;
+    if (mainWindow && !mainWindow.isDestroyed() && rendererReady) {
+        mainWindow.webContents.send('file-opened', payload);
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.focus();
+    }
+}
+
+async function openAssociatedPath(filePath: string) {
+    try {
+        deliverOpenedFile(await readOpenedFile(filePath));
+    } catch (error) {
+        console.error('Failed to open associated file:', error);
+        dialog.showErrorBox(
+            'NeuroScan AI',
+            `Could not open file:\n${filePath}\n\n${error instanceof Error ? error.message : String(error)}`
+        );
+    }
+}
+
 // Environment check
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
 
@@ -73,6 +131,16 @@ function createWindow() {
     } else {
         mainWindow.loadFile(join(__dirname, '../dist/index.html'));
     }
+
+    mainWindow.webContents.on('did-start-loading', () => {
+        rendererReady = false;
+    });
+    mainWindow.webContents.on('did-finish-load', () => {
+        rendererReady = true;
+        if (pendingOpenFile) {
+            mainWindow?.webContents.send('file-opened', pendingOpenFile);
+        }
+    });
 
     // Show window when ready
     mainWindow.once('ready-to-show', () => {
@@ -142,6 +210,32 @@ function createMenu() {
         {
             label: 'View',
             submenu: [
+                {
+                    label: 'Layout',
+                    submenu: [
+                        {
+                            label: 'Four-Up',
+                            click: () => mainWindow?.webContents.send('menu-set-view-mode', 'FOUR_UP')
+                        },
+                        {
+                            label: 'Axial',
+                            click: () => mainWindow?.webContents.send('menu-set-view-mode', 'AXIAL')
+                        },
+                        {
+                            label: 'Sagittal',
+                            click: () => mainWindow?.webContents.send('menu-set-view-mode', 'SAGITTAL')
+                        },
+                        {
+                            label: 'Coronal',
+                            click: () => mainWindow?.webContents.send('menu-set-view-mode', 'CORONAL')
+                        },
+                        {
+                            label: '3D',
+                            click: () => mainWindow?.webContents.send('menu-set-view-mode', '3D')
+                        }
+                    ]
+                },
+                { type: 'separator' },
                 { role: 'reload' },
                 { role: 'forceReload' },
                 { role: 'toggleDevTools' },
@@ -309,33 +403,54 @@ ipcMain.handle('app:getVersion', () => {
     return app.getVersion();
 });
 
-// App lifecycle
-app.whenReady().then(() => {
-    createWindow();
+ipcMain.handle('app:takePendingOpenFile', () => {
+    const file = pendingOpenFile;
+    pendingOpenFile = null;
+    return file;
+});
 
-    app.on('activate', () => {
-        if (BrowserWindow.getAllWindows().length === 0) {
-            createWindow();
+const gotInstanceLock = !app.isPackaged || app.requestSingleInstanceLock();
+if (!gotInstanceLock) {
+    app.quit();
+} else {
+    app.on('second-instance', (_event, argv) => {
+        const filePath = filePathFromArgv(argv);
+        if (filePath) void openAssociatedPath(filePath);
+        if (mainWindow) {
+            if (mainWindow.isMinimized()) mainWindow.restore();
+            mainWindow.focus();
         }
     });
+}
+
+// macOS: can fire before ready
+app.on('open-file', (event, filePath) => {
+    event.preventDefault();
+    if (app.isReady()) {
+        void openAssociatedPath(filePath);
+    } else {
+        queuedOpenPath = filePath;
+    }
 });
+
+if (gotInstanceLock) {
+    app.whenReady().then(() => {
+        createWindow();
+
+        const toOpen = queuedOpenPath || filePathFromArgv(process.argv);
+        queuedOpenPath = null;
+        if (toOpen) void openAssociatedPath(toOpen);
+
+        app.on('activate', () => {
+            if (BrowserWindow.getAllWindows().length === 0) {
+                createWindow();
+            }
+        });
+    });
+}
 
 app.on('window-all-closed', () => {
     if (process.platform !== 'darwin') {
         app.quit();
-    }
-});
-
-// Handle file associations (when app is already running)
-app.on('open-file', async (event, path) => {
-    event.preventDefault();
-
-    if (mainWindow) {
-        const buffer = await readFile(path);
-        mainWindow.webContents.send('file-opened', {
-            name: path.split(/[\\/]/).pop() || 'unknown',
-            path: path,
-            data: buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
-        });
     }
 });
