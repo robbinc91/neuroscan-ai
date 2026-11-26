@@ -7,6 +7,9 @@ import html2canvas from "html2canvas";
 import { jpegDataUrlSize } from '../utils/reportImages';
 import { ensureVolumeMetadata, voxelSpacingMm } from '../utils/volumeMetadata';
 import { computeSegmentationStats } from '../utils/segmentationStats';
+import { computeTissueContrast, computeVolumeIntensityStats, TissueContrast, VolumeIntensityStats } from '../utils/volumeStats';
+import { csvPhiHeader, reportPatientLine } from '../utils/reportPhi';
+import { toast } from '../utils/toasts';
 
 let lastHandledExportId = 0;
 
@@ -16,13 +19,23 @@ interface AnalysisPanelProps {
     onGenerateReport?: () => Promise<ReportImages | undefined>;
     /** Increment to run Clinical Summary export (File > Export Report). */
     exportRequestId?: number;
+    anonymize?: boolean;
+    onAnonymizeChange?: (value: boolean) => void;
 }
 
-export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ volume, segmentation, onGenerateReport, exportRequestId = 0 }) => {
+export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({
+    volume, segmentation, onGenerateReport, exportRequestId = 0, anonymize = true, onAnonymizeChange
+}) => {
     const [generating, setGenerating] = useState(false);
     const [stats, setStats] = useState<SegmentationStats[]>([]);
+    const [volumeStats, setVolumeStats] = useState<VolumeIntensityStats | null>(null);
+    const [tissue, setTissue] = useState<TissueContrast | null>(null);
     const statsRef = useRef<SegmentationStats[]>([]);
     statsRef.current = stats;
+    const volumeStatsRef = useRef<VolumeIntensityStats | null>(null);
+    volumeStatsRef.current = volumeStats;
+    const tissueRef = useRef<TissueContrast | null>(null);
+    tissueRef.current = tissue;
     const [labelMapping, setLabelMapping] = useState<Record<string, string>>({});
     const jsonInputRef = useRef<HTMLInputElement>(null);
     const chartRef = useRef<HTMLDivElement>(null);
@@ -32,16 +45,27 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ volume, segmentati
     };
 
     const toCsv = () => {
-        const header = 'label,volume_cm3,intensity_mean,intensity_std';
-        const rows = stats.map((s) =>
-            [
+        const meta = volume ? ensureVolumeMetadata(volume) : null;
+        const lines = [csvPhiHeader(meta, anonymize), 'scope,label,volume_cm3,intensity_mean,intensity_std'];
+        const vs = volumeStats;
+        if (vs) {
+            lines.push(['volume', 'all_voxels', vs.volumeCm3.toFixed(4), vs.mean.toFixed(4), vs.std.toFixed(4)].join(','));
+            lines.push(['volume', 'foreground', vs.foregroundCm3.toFixed(4), '', ''].join(','));
+        }
+        const tc = tissue;
+        if (tc?.snrWm != null) lines.push(`qc,SNR_WM,,${tc.snrWm.toFixed(4)},`);
+        if (tc?.snrGm != null) lines.push(`qc,SNR_GM,,${tc.snrGm.toFixed(4)},`);
+        if (tc?.cnr != null) lines.push(`qc,CNR_WM_GM,,${tc.cnr.toFixed(4)},`);
+        for (const s of stats) {
+            lines.push([
+                'region',
                 `"${String(s.label).replace(/"/g, '""')}"`,
                 s.volume.toFixed(4),
                 s.intensityMean.toFixed(4),
                 s.intensityStd.toFixed(4)
-            ].join(',')
-        );
-        return [header, ...rows].join('\n');
+            ].join(','));
+        }
+        return lines.join('\n');
     };
 
     const getChartImage = async () => {
@@ -90,10 +114,7 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ volume, segmentati
         doc.setTextColor(148, 163, 184);
         doc.text(`Date: ${new Date().toLocaleDateString()}`, margin, 30);
         if (meta) {
-            const who = meta.patientName && meta.patientId
-                ? `${meta.patientName}  ${meta.patientId}`
-                : meta.patientId || meta.patientName || '—';
-            doc.text(`Patient: ${who}`, margin, 36);
+            doc.text(reportPatientLine(meta, anonymize), margin, 36);
             const studyBits = [meta.modality, meta.studyDate, meta.seriesDescription || meta.studyDescription]
                 .filter(Boolean)
                 .join(' · ');
@@ -115,6 +136,45 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ volume, segmentati
             yPos += 80;
         }
 
+        const vs = volumeStatsRef.current;
+        if (vs) {
+            doc.setFontSize(12);
+            doc.setTextColor(34, 211, 238);
+            doc.text('Whole-volume intensity', margin, yPos);
+            yPos += 8;
+            doc.setFontSize(10);
+            doc.setTextColor(200, 200, 200);
+            doc.text(
+                `Mean ${vs.mean.toFixed(1)}  SD ${vs.std.toFixed(1)}  min ${vs.min.toFixed(1)}  max ${vs.max.toFixed(1)}`,
+                margin,
+                yPos
+            );
+            yPos += 6;
+            doc.text(
+                `P5/P50/P95  ${vs.p5.toFixed(1)} / ${vs.p50.toFixed(1)} / ${vs.p95.toFixed(1)}   FOV ${vs.volumeCm3.toFixed(1)} cm³   FG ${vs.foregroundCm3.toFixed(1)} cm³`,
+                margin,
+                yPos
+            );
+            yPos += 10;
+        }
+
+        const tc = tissueRef.current;
+        if (tc && (tc.snrWm != null || tc.cnr != null)) {
+            doc.setFontSize(12);
+            doc.setTextColor(34, 211, 238);
+            doc.text('Tissue contrast', margin, yPos);
+            yPos += 8;
+            doc.setFontSize(10);
+            doc.setTextColor(200, 200, 200);
+            const bits = [
+                tc.snrWm != null ? `SNR WM ${tc.snrWm.toFixed(2)}` : null,
+                tc.snrGm != null ? `SNR GM ${tc.snrGm.toFixed(2)}` : null,
+                tc.cnr != null ? `CNR ${tc.cnr.toFixed(2)}` : null
+            ].filter(Boolean);
+            doc.text(bits.join('   '), margin, yPos);
+            yPos += 10;
+        }
+
         doc.setFontSize(12);
         doc.setTextColor(34, 211, 238);
         doc.text("Region Statistics", margin, yPos);
@@ -124,7 +184,7 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ volume, segmentati
         if (regionStats.length === 0) {
             doc.setFontSize(10);
             doc.setTextColor(148, 163, 184);
-            doc.text("No labeled voxels in the current segmentation.", margin, yPos);
+            doc.text(segmentation ? 'No labeled voxels in the current segmentation.' : 'No segmentation loaded.', margin, yPos);
         } else {
             doc.setFontSize(10);
             doc.setTextColor(200, 200, 200);
@@ -224,39 +284,36 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ volume, segmentati
         return doc;
     };
 
-    // Calculate Segmentation Stats
     useEffect(() => {
-        if (!volume || !segmentation) {
+        if (!volume) {
+            setVolumeStats(null);
+            setTissue(null);
             setStats([]);
             return;
         }
-
         const timer = setTimeout(() => {
-            setStats(computeSegmentationStats(volume, segmentation, labelMapping));
-        }, 100);
-
+            const vs = computeVolumeIntensityStats(volume);
+            setVolumeStats(vs);
+            setTissue(computeTissueContrast(volume, segmentation, vs, labelMapping));
+            setStats(segmentation ? computeSegmentationStats(volume, segmentation, labelMapping) : []);
+        }, 80);
         return () => clearTimeout(timer);
-
     }, [volume, segmentation, labelMapping]);
 
     const handleClinicalSummaryExport = async () => {
         if (!onGenerateReport) return;
         if (!volume) {
-            alert('Load a scan before exporting a report.');
-            return;
-        }
-        if (!segmentation) {
-            alert('Load or create a segmentation before exporting a report.');
+            toast('Load a scan before exporting a report.', 'warning');
             return;
         }
         if (!window.electron) {
-            alert('Report export requires the desktop app.');
+            toast('Report export requires the desktop app.', 'warning');
             return;
         }
         setGenerating(true);
 
         try {
-            if (statsRef.current.length === 0) {
+            if (statsRef.current.length === 0 && !volumeStatsRef.current) {
                 await new Promise((resolve) => setTimeout(resolve, 200));
             }
             const images = await onGenerateReport();
@@ -267,7 +324,7 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ volume, segmentati
             ]);
         } catch (e) {
             console.error(e);
-            alert("Error generating clinical summary PDF");
+            toast("Error generating clinical summary PDF");
         } finally {
             setGenerating(false);
         }
@@ -283,7 +340,7 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ volume, segmentati
     }, [exportRequestId]);
 
     const handleResearchMetricsExport = async () => {
-        if (stats.length === 0) return;
+        if (!volumeStats && stats.length === 0) return;
 
         try {
             const csv = toCsv();
@@ -293,12 +350,12 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ volume, segmentati
             ]);
         } catch (e) {
             console.error(e);
-            alert('Error exporting research metrics CSV');
+            toast('Error exporting research metrics CSV');
         }
     };
 
     const handlePresentationPackExport = async () => {
-        if (stats.length === 0 || !onGenerateReport) return;
+        if (!volume || !onGenerateReport) return;
         setGenerating(true);
 
         try {
@@ -310,10 +367,13 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ volume, segmentati
             const images = await onGenerateReport();
             const chartImage = await getChartImage();
             const csv = toCsv();
+            const meta = volume ? ensureVolumeMetadata(volume) : null;
             const readme = [
                 'NeuroScan AI Presentation Pack',
                 `Generated: ${new Date().toISOString()}`,
+                csvPhiHeader(meta, anonymize),
                 '',
+                'Slice JPEGs do not burn patient name or ID.',
                 'Files included:',
                 '- metrics/research_metrics.csv',
                 '- images/chart.png',
@@ -348,7 +408,7 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ volume, segmentati
             }
         } catch (e) {
             console.error(e);
-            alert('Error exporting presentation pack');
+            toast('Error exporting presentation pack');
         } finally {
             setGenerating(false);
         }
@@ -364,42 +424,100 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ volume, segmentati
             if (typeof mapping === 'object') {
                 setLabelMapping(mapping);
             } else {
-                alert("Invalid JSON format. Expected key-value pairs.");
+                toast("Invalid JSON format. Expected key-value pairs.");
             }
         } catch (err) {
             console.error(err);
-            alert("Failed to parse JSON.");
+            toast("Failed to parse JSON.");
         }
         if (jsonInputRef.current) jsonInputRef.current.value = '';
     };
 
-    if (!segmentation) {
+    if (!volume) {
         return (
             <div className="h-full flex flex-col items-center justify-center p-6 text-center text-gray-500">
                 <FileText className="w-12 h-12 mb-4 opacity-20" />
-                <p>No Segmentation Mask Loaded.</p>
-                <p className="text-xs mt-2">Please load a segmentation file or run segmentation to view analysis.</p>
+                <p>Load a scan to see intensity statistics.</p>
+                <p className="text-xs mt-2">A segmentation is optional for SNR/CNR and region volumes.</p>
             </div>
         );
     }
 
     return (
-        <div className="h-full flex flex-col p-4 gap-6 overflow-y-auto">
+        <div className="h-full flex flex-col p-4 gap-5 overflow-y-auto">
+            <label className="flex items-center justify-between gap-2 text-[11px] text-gray-300 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2">
+                <span>Anonymize exports (omit name and ID)</span>
+                <input
+                    type="checkbox"
+                    checked={anonymize}
+                    onChange={(e) => onAnonymizeChange?.(e.target.checked)}
+                    className="accent-cyan-500"
+                />
+            </label>
+
+            <div>
+                <h3 className="text-sm font-semibold text-gray-200 mb-3 uppercase tracking-wider">Intensity histogram</h3>
+                {volumeStats ? (
+                    <div ref={chartRef} className="h-40 w-full bg-gray-900 rounded-lg p-2 border border-gray-800">
+                        <ResponsiveContainer width="100%" height="100%">
+                            <BarChart data={volumeStats.histogram}>
+                                <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                                <XAxis dataKey="x" fontSize={9} stroke="#9ca3af" tickFormatter={(v: number) => Number(v).toFixed(0)} />
+                                <YAxis fontSize={9} stroke="#9ca3af" />
+                                <Tooltip
+                                    contentStyle={{ backgroundColor: '#1f2937', borderColor: '#374151', color: '#f3f4f6' }}
+                                    itemStyle={{ color: '#f3f4f6' }}
+                                    formatter={(value: number) => [value.toLocaleString(), 'voxels']}
+                                    labelFormatter={(v) => `Intensity ${Number(v).toFixed(1)}`}
+                                />
+                                <Bar dataKey="count" name="Voxels" fill="#22d3ee" />
+                            </BarChart>
+                        </ResponsiveContainer>
+                    </div>
+                ) : (
+                    <div className="h-40 bg-gray-900 rounded-lg flex items-center justify-center text-xs text-gray-600">
+                        Computing…
+                    </div>
+                )}
+            </div>
+
+            {volumeStats && (
+                <div className="grid grid-cols-2 gap-2 text-[11px]">
+                    <StatChip label="Mean" value={volumeStats.mean.toFixed(1)} />
+                    <StatChip label="SD" value={volumeStats.std.toFixed(1)} />
+                    <StatChip label="Min / max" value={`${volumeStats.min.toFixed(0)} / ${volumeStats.max.toFixed(0)}`} />
+                    <StatChip label="P5 / P50 / P95" value={`${volumeStats.p5.toFixed(0)} / ${volumeStats.p50.toFixed(0)} / ${volumeStats.p95.toFixed(0)}`} />
+                    <StatChip label="FOV cm³" value={volumeStats.volumeCm3.toFixed(1)} />
+                    <StatChip label="Foreground cm³" value={volumeStats.foregroundCm3.toFixed(1)} />
+                </div>
+            )}
+
+            {tissue && (tissue.snrWm != null || tissue.cnr != null || tissue.note) && (
+                <div className="bg-gray-800 rounded-lg border border-gray-700 p-3 space-y-2">
+                    <h3 className="text-sm font-semibold text-gray-200 uppercase tracking-wider">SNR / CNR</h3>
+                    <div className="grid grid-cols-3 gap-2 text-[11px]">
+                        <StatChip label="SNR WM" value={tissue.snrWm != null ? tissue.snrWm.toFixed(2) : '—'} />
+                        <StatChip label="SNR GM" value={tissue.snrGm != null ? tissue.snrGm.toFixed(2) : '—'} />
+                        <StatChip label="CNR" value={tissue.cnr != null ? tissue.cnr.toFixed(2) : '—'} />
+                    </div>
+                    <p className="text-[10px] text-gray-500 leading-snug">{tissue.note}</p>
+                </div>
+            )}
+
             <div>
                 <div className="flex justify-between items-end mb-3">
-                    <h3 className="text-sm font-semibold text-gray-200 uppercase tracking-wider">Volumetric Analysis</h3>
+                    <h3 className="text-sm font-semibold text-gray-200 uppercase tracking-wider">Region volumes</h3>
                     <button
                         onClick={() => jsonInputRef.current?.click()}
                         className="text-[10px] flex items-center gap-1 text-cyan-400 hover:text-cyan-300 transition-colors"
-                        title="Import JSON Label Mapping ({ '1': 'Hippocampus' })"
+                        title="Import JSON Label Mapping ({ '1': 'Hippocampus', '2': 'GM', '3': 'WM' })"
                     >
                         <FileJson className="w-3 h-3" /> Map Labels
                     </button>
                     <input type="file" ref={jsonInputRef} onChange={handleJsonUpload} accept=".json" className="hidden" />
                 </div>
-
-                {stats.length > 0 ? (
-                    <div ref={chartRef} className="h-48 w-full bg-gray-900 rounded-lg p-2 border border-gray-800">
+                {stats.length > 0 && (
+                    <div className="h-36 w-full bg-gray-900 rounded-lg p-2 border border-gray-800 mb-3">
                         <ResponsiveContainer width="100%" height="100%">
                             <BarChart data={stats}>
                                 <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
@@ -411,22 +529,14 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ volume, segmentati
                                     formatter={(value: number) => [value.toFixed(2), '']}
                                 />
                                 <Bar dataKey="volume" name="Volume (cm³)" fill="#00a3c4">
-                                    {stats.map((entry, index) => (
+                                    {stats.map((_, index) => (
                                         <Cell key={`cell-${index}`} fill={['#00a3c4', '#a855f7', '#10b981', '#ef4444', '#f59e0b', '#ec4899'][index % 6]} />
                                     ))}
                                 </Bar>
                             </BarChart>
                         </ResponsiveContainer>
                     </div>
-                ) : (
-                    <div className="h-48 bg-gray-900 rounded-lg flex items-center justify-center text-xs text-gray-600">
-                        No labeled voxels found greater than 0
-                    </div>
                 )}
-            </div>
-
-            <div>
-                <h3 className="text-sm font-semibold text-gray-200 mb-3 uppercase tracking-wider">Region Statistics</h3>
                 <div className="bg-gray-800 rounded-lg overflow-hidden border border-gray-700">
                     <div className="overflow-x-auto">
                         <table className="w-full text-xs text-left">
@@ -440,7 +550,7 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ volume, segmentati
                             </thead>
                             <tbody className="text-gray-300">
                                 {stats.length === 0 && (
-                                    <tr><td colSpan={4} className="p-4 text-center text-gray-600">No data</td></tr>
+                                    <tr><td colSpan={4} className="p-4 text-center text-gray-600">{segmentation ? 'No labeled voxels' : 'Load a segmentation for region volumes'}</td></tr>
                                 )}
                                 {stats.map((s, i) => (
                                     <tr key={i} className="border-t border-gray-700 hover:bg-gray-750/50 transition-colors">
@@ -467,7 +577,7 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ volume, segmentati
                 </button>
                 <button
                     onClick={handleResearchMetricsExport}
-                    disabled={generating || stats.length === 0}
+                    disabled={generating || (!volumeStats && stats.length === 0)}
                     className="w-full py-3 bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg flex items-center justify-center gap-2 transition-all shadow-lg"
                 >
                     <Table2 className="w-4 h-4" />
@@ -475,7 +585,7 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ volume, segmentati
                 </button>
                 <button
                     onClick={handlePresentationPackExport}
-                    disabled={generating || stats.length === 0}
+                    disabled={generating || !volume}
                     className="w-full py-3 bg-purple-700 hover:bg-purple-600 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg flex items-center justify-center gap-2 transition-all shadow-lg"
                 >
                     <Presentation className="w-4 h-4" />
@@ -485,3 +595,12 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ volume, segmentati
         </div>
     );
 };
+
+function StatChip({ label, value }: { label: string; value: string }) {
+    return (
+        <div className="bg-gray-800 border border-gray-700 rounded px-2 py-1.5">
+            <div className="text-[9px] uppercase tracking-wide text-gray-500">{label}</div>
+            <div className="font-mono text-cyan-300">{value}</div>
+        </div>
+    );
+}

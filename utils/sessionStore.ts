@@ -11,6 +11,7 @@ const KEY_VIEW_MODE = 'session.viewMode';
 const KEY_WINDOW_LEVEL = 'session.windowLevel';
 const KEY_CONVENTION = 'session.displayConvention';
 const KEY_RECENT = 'session.recentFiles';
+const KEY_ANONYMIZE = 'session.anonymizeExports';
 const MAX_RECENT = 8;
 
 export async function loadSessionPrefs(): Promise<{
@@ -18,13 +19,15 @@ export async function loadSessionPrefs(): Promise<{
     windowLevel?: WindowLevel;
     convention?: DisplayConvention;
     recentFiles: RecentFile[];
+    anonymizeExports: boolean;
 }> {
-    if (!window.electron) return { recentFiles: [] };
-    const [viewMode, windowLevel, convention, recentFiles] = await Promise.all([
+    if (!window.electron) return { recentFiles: [], anonymizeExports: true };
+    const [viewMode, windowLevel, convention, recentFiles, anonymize] = await Promise.all([
         window.electron.store.get(KEY_VIEW_MODE),
         window.electron.store.get(KEY_WINDOW_LEVEL),
         window.electron.store.get(KEY_CONVENTION),
-        window.electron.store.get(KEY_RECENT)
+        window.electron.store.get(KEY_RECENT),
+        window.electron.store.get(KEY_ANONYMIZE)
     ]);
     return {
         viewMode: viewMode as ViewMode | undefined,
@@ -32,7 +35,8 @@ export async function loadSessionPrefs(): Promise<{
             ? { width: windowLevel.width, center: windowLevel.center }
             : undefined,
         convention: convention === 'neurological' ? 'neurological' : 'radiological',
-        recentFiles: Array.isArray(recentFiles) ? recentFiles : []
+        recentFiles: Array.isArray(recentFiles) ? recentFiles : [],
+        anonymizeExports: anonymize === false ? false : true
     };
 }
 
@@ -46,6 +50,10 @@ export async function saveWindowLevel(wl: WindowLevel) {
 
 export async function saveConvention(convention: DisplayConvention) {
     await window.electron?.store.set(KEY_CONVENTION, convention);
+}
+
+export async function saveAnonymizeExports(anonymize: boolean) {
+    await window.electron?.store.set(KEY_ANONYMIZE, anonymize);
 }
 
 export async function pushRecentFile(path: string, name: string): Promise<RecentFile[]> {

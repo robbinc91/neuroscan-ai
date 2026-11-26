@@ -15,6 +15,7 @@ export type VolumeWorkerRequest =
         refData?: Float32Array;
         refMin?: number;
         refMax?: number;
+        highAccuracy?: boolean;
     }
     | {
         requestId: number;

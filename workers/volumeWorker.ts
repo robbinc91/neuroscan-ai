@@ -27,6 +27,7 @@ ctx.onmessage = async (event: MessageEvent<VolumeWorkerRequest>) => {
                 refData: msg.refData,
                 refMin: msg.refMin,
                 refMax: msg.refMax,
+                highAccuracy: msg.highAccuracy,
                 onProgress
             });
             const res: VolumeWorkerResponse = {

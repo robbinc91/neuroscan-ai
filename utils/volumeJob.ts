@@ -72,6 +72,7 @@ export function runProcessJob(
     param2: number,
     options?: {
         reference?: VolumeData | null;
+        highAccuracy?: boolean;
         onProgress?: (pct: number) => void;
     }
 ): JobHandle<{ data: Float32Array; min: number; max: number; geometryNotes?: string }> {
@@ -96,7 +97,8 @@ export function runProcessJob(
         geometryNotes: volume.geometryNotes,
         refData,
         refMin: options?.reference?.min,
-        refMax: options?.reference?.max
+        refMax: options?.reference?.max,
+        highAccuracy: options?.highAccuracy
     };
 
     const promise = new Promise<{ data: Float32Array; min: number; max: number; geometryNotes?: string }>((resolve, reject) => {

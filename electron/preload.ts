@@ -18,6 +18,10 @@ const electronAPI = {
         return await ipcRenderer.invoke('dialog:selectDirectory');
     },
 
+    readMedicalFolder: async (dirPath?: string) => {
+        return await ipcRenderer.invoke('fs:readMedicalFolder', dirPath);
+    },
+
     writeBundle: async (directoryPath: string, files: Array<{
         relativePath: string;
         content: string;
@@ -54,6 +58,11 @@ const electronAPI = {
         return () => ipcRenderer.removeListener('menu-import-scan', callback);
     },
 
+    onMenuImportFolder: (callback: () => void) => {
+        ipcRenderer.on('menu-import-folder', callback);
+        return () => ipcRenderer.removeListener('menu-import-folder', callback);
+    },
+
     onMenuImportSegmentation: (callback: () => void) => {
         ipcRenderer.on('menu-import-segmentation', callback);
         return () => ipcRenderer.removeListener('menu-import-segmentation', callback);
@@ -81,6 +90,11 @@ const electronAPI = {
     onMenuOpenSettings: (callback: () => void) => {
         ipcRenderer.on('menu-open-settings', callback);
         return () => ipcRenderer.removeListener('menu-open-settings', callback);
+    },
+
+    onMenuUndo: (callback: () => void) => {
+        ipcRenderer.on('menu-undo', callback);
+        return () => ipcRenderer.removeListener('menu-undo', callback);
     },
 
     onMenuSetViewMode: (callback: (mode: string) => void) => {

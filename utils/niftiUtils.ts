@@ -5,6 +5,25 @@ import { metadataFromNifti } from './volumeMetadata';
 
 type NiftiNumericArray = Float32Array | Int16Array | Uint8Array | Int32Array | Float64Array | Uint16Array;
 
+function isGzipBuffer(data: ArrayBuffer): boolean {
+    if (data.byteLength < 2) return false;
+    const b = new Uint8Array(data);
+    return b[0] === 0x1f && b[1] === 0x8b;
+}
+
+/** Chromium native gzip — much faster than nifti-reader-js / fflate on first .nii.gz load. */
+async function gunzipNative(data: ArrayBuffer): Promise<ArrayBuffer> {
+    if (typeof DecompressionStream === 'undefined') {
+        return nifti.decompress(data);
+    }
+    try {
+        const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream('gzip'));
+        return await new Response(stream).arrayBuffer();
+    } catch {
+        return nifti.decompress(data);
+    }
+}
+
 function applyNiftiIntensityScale(
     header: { scl_slope?: number; scl_inter?: number },
     typedData: NiftiNumericArray
@@ -62,22 +81,17 @@ function coordSystemFromNiftiHeader(header: { qform_code?: number; sform_code?: 
     return 'UNKNOWN';
 }
 
-export const parseNiftiFile = (arrayBuffer: ArrayBuffer): VolumeData | null => {
-    let data = arrayBuffer;
-
-    if (nifti.isCompressed(data)) {
-        data = nifti.decompress(data);
-    }
-
+function parseNiftiUncompressed(data: ArrayBuffer): VolumeData | null {
     if (!nifti.isNIFTI(data)) {
         console.error('Not a valid NIfTI file');
         return null;
     }
 
     const header = nifti.readHeader(data);
+    if (!header) return null;
     const image = nifti.readImage(header, data);
 
-    let typedData: Float32Array | Int16Array | Uint8Array | Int32Array | Float64Array | Uint16Array;
+    let typedData: NiftiNumericArray;
 
     switch (header.datatypeCode) {
         case 2:
@@ -129,4 +143,38 @@ export const parseNiftiFile = (arrayBuffer: ArrayBuffer): VolumeData | null => {
     };
     volume.metadata = metadataFromNifti(volume);
     return volume;
+}
+
+export const parseNiftiFile = (arrayBuffer: ArrayBuffer): VolumeData | null => {
+    let data = arrayBuffer;
+    if (nifti.isCompressed(data) || isGzipBuffer(data)) {
+        data = nifti.decompress(data);
+    }
+    return parseNiftiUncompressed(data);
 };
+
+/** Same as parseNiftiFile, but gzip uses the browser's native decompressor and yields to the UI. */
+export async function parseNiftiFileAsync(arrayBuffer: ArrayBuffer): Promise<VolumeData | null> {
+    let data = arrayBuffer;
+    if (nifti.isCompressed(data) || isGzipBuffer(data)) {
+        data = await gunzipNative(data);
+    }
+    return parseNiftiUncompressed(data);
+}
+
+/** Prime gzip + NIfTI code paths so the first real load is not a cold JIT. */
+export async function warmupNiftiParser(): Promise<void> {
+    try {
+        nifti.isCompressed(new Uint8Array([0, 0]).buffer);
+        if (typeof DecompressionStream !== 'undefined') {
+            void new DecompressionStream('gzip');
+        }
+        const emptyGz = Uint8Array.from([
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
+            0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+        ]);
+        await gunzipNative(emptyGz.buffer);
+    } catch {
+        /* warmup only */
+    }
+}

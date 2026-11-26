@@ -2,8 +2,9 @@ import React, { useState, useEffect, useRef } from 'react';
 import { ToolCategory, VolumeData, ViewportTool } from '../types';
 import { Play, RotateCcw, Loader2, Check, Trash2, Sliders, Wand2, UploadCloud, CloudLightning, Server, RefreshCw, PenTool, Eraser, MousePointer2, Hand, Info, Cpu } from 'lucide-react';
 import { parseNiftiFile } from '../utils/niftiUtils';
-import { volumeGeometryJson } from '../utils/volumeGeometry';
 import { cancelVolumeJob, runProcessJob, runSegmentJob, VolumeJobCancelled } from '../utils/volumeJob';
+import { cancelInferenceJob, InferenceCancelled, InferenceTimeout, runInferenceJob } from '../utils/inferenceJob';
+import { toast } from '../utils/toasts';
 
 interface ProcessingPanelProps {
     mode: ToolCategory;
@@ -44,7 +45,9 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
 }) => {
     const [isProcessing, setIsProcessing] = useState(false);
     const [progress, setProgress] = useState(0);
+    const [progressLabel, setProgressLabel] = useState('');
     const [completed, setCompleted] = useState(false);
+    const [n4HighAccuracy, setN4HighAccuracy] = useState(false);
     
     // Processing State
     const [procMethod, setProcMethod] = useState<string>('hist_eq');
@@ -110,10 +113,10 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
             const buf = await file.arrayBuffer();
             const vol = parseNiftiFile(buf);
             if (vol) setReferenceVolume(vol);
-            else alert("Invalid NIfTI file");
+            else toast("Invalid NIfTI file");
         } catch (err) {
             console.error(err);
-            alert("Error reading reference volume");
+            toast("Error reading reference volume");
         }
     };
 
@@ -131,6 +134,7 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
         try {
             const job = runProcessJob(volume, procMethod, param1, param2, {
                 reference: procMethod === 'hist_match' ? referenceVolume : null,
+                highAccuracy: procMethod === 'n4_bias' && n4HighAccuracy,
                 onProgress: setProgress
             });
             const result = await job.promise;
@@ -146,7 +150,7 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
         } catch (e: unknown) {
             if (e instanceof VolumeJobCancelled) return;
             console.error(e);
-            alert('Processing failed: ' + (e instanceof Error ? e.message : 'Unknown error'));
+            toast('Processing failed: ' + (e instanceof Error ? e.message : 'Unknown error'));
         } finally {
             setIsProcessing(false);
         }
@@ -155,7 +159,7 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
     const runSegmentation = async () => {
         if (!volume || !onUpdateSegmentation) return;
         if (segMethod === 'manual_draw') {
-            alert("Manual drawing is active. Use the Brush tool on the viewports.");
+            toast("Manual drawing is active. Use the Brush tool on the viewports.", 'info');
             return;
         }
 
@@ -187,7 +191,7 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
         } catch (e: unknown) {
             if (e instanceof VolumeJobCancelled) return;
             console.error(e);
-            alert('Segmentation failed: ' + (e instanceof Error ? e.message : 'Unknown error'));
+            toast('Segmentation failed: ' + (e instanceof Error ? e.message : 'Unknown error'));
         } finally {
             setIsProcessing(false);
         }
@@ -261,60 +265,47 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
     const runBackendSegmentation = async () => {
         if (!volume || !onUpdateSegmentation || !selectedModelId) return;
         setIsProcessing(true);
-        setProgress(10);
-        
+        setProgress(0);
+        setProgressLabel('starting');
+
         try {
-            const blob = new Blob([volume.data.buffer], { type: 'application/octet-stream' });
-            const formData = new FormData();
-            formData.append('file', blob, 'volume.raw');
-            formData.append('dimensions', JSON.stringify(volume.dimensions));
-            formData.append('model_id', selectedModelId);
-            formData.append('geometry', volumeGeometryJson(volume));
-
-            setProgress(30);
-
-            const baseUrl = serverUrl.replace(/\/$/, '');
-            const response = await fetch(`${baseUrl}/predict`, {
-                method: 'POST',
-                body: formData
+            const segVol = await runInferenceJob({
+                baseUrl: serverUrl,
+                volume,
+                modelId: selectedModelId,
+                onProgress: (pct, label) => {
+                    setProgress(pct);
+                    setProgressLabel(label || '');
+                }
             });
 
-            if (!response.ok) {
-                throw new Error(`Server returned ${response.status}: ${response.statusText}`);
+            if (segVol.header.datatypeCode !== 2) {
+                const len = segVol.data.length;
+                const maskData = new Uint8Array(len);
+                for (let i = 0; i < len; i++) maskData[i] = segVol.data[i];
+                segVol.data = maskData;
+                segVol.header.datatypeCode = 2;
             }
 
-            setProgress(60);
-
-            const responseBuffer = await response.arrayBuffer();
-            const segVol = parseNiftiFile(responseBuffer);
-
-            if (segVol) {
-                if (segVol.header.datatypeCode !== 2) {
-                    const len = segVol.data.length;
-                    const maskData = new Uint8Array(len);
-                    for(let i=0; i<len; i++) maskData[i] = segVol.data[i];
-                    segVol.data = maskData;
-                    segVol.header.datatypeCode = 2;
-                }
-
-                const d = volume.dimensions;
-                const sd = segVol.dimensions;
-                if (d[0] === sd[0] && d[1] === sd[1] && d[2] === sd[2] && volume.affine) {
-                    segVol.affine = [...volume.affine];
-                    segVol.coordSystem = volume.coordSystem;
-                    segVol.geometryNotes = `cloud_inference_output;aligned_to_input_volume;${segVol.geometryNotes || ''}`;
-                }
-                
-                onUpdateSegmentation(segVol);
-                setCompleted(true);
-                setProgress(100);
-            } else {
-                throw new Error("Failed to parse response as NIfTI");
+            const d = volume.dimensions;
+            const sd = segVol.dimensions;
+            if (d[0] === sd[0] && d[1] === sd[1] && d[2] === sd[2] && volume.affine) {
+                segVol.affine = [...volume.affine];
+                segVol.coordSystem = volume.coordSystem;
+                segVol.geometryNotes = `cloud_inference_output;aligned_to_input_volume;${segVol.geometryNotes || ''}`;
             }
 
-        } catch (e: any) {
+            onUpdateSegmentation(segVol);
+            setCompleted(true);
+            setProgress(100);
+            setProgressLabel('complete');
+        } catch (e: unknown) {
+            if (e instanceof InferenceCancelled) return;
             console.error(e);
-            alert(`External Segmentation Failed: ${e.message}`);
+            const message = e instanceof InferenceTimeout
+                ? e.message
+                : e instanceof Error ? e.message : 'Unknown error';
+            toast(`External Segmentation Failed: ${message}`);
         } finally {
             setIsProcessing(false);
         }
@@ -407,7 +398,7 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
                                     />
                                 </div>
                                 <div className="text-[10px] text-gray-500 italic leading-snug">
-                                    Per-slice CLAHE: clipped histograms on a tile grid with bilinear LUT interpolation.
+                                    Real tiled CLAHE (OpenCV-style): clipped per-tile CDFs, bilinear LUT blend, applied to every axial slice.
                                 </div>
                             </>
                          )}
@@ -457,18 +448,18 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
                                 </div>
                                 <div className="space-y-1">
                                     <label className="flex justify-between text-xs text-gray-400">
-                                        <span>Blur σ (voxels)</span>
-                                        <span className="font-mono">{param2.toFixed(2)}</span>
-                                    </label>
-                                    <input
-                                        type="range" min="0.3" max="3.0" step="0.1"
-                                        value={param2}
-                                        onChange={(e) => setParam2(Number(e.target.value))}
-                                        className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
-                                    />
+                                    <span>Blur σ (mm)</span>
+                                    <span className="font-mono">{param2.toFixed(2)}</span>
+                                </label>
+                                <input
+                                    type="range" min="0.3" max="3.0" step="0.1"
+                                    value={param2}
+                                    onChange={(e) => setParam2(Number(e.target.value))}
+                                    className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+                                />
                                 </div>
                                 <div className="text-[10px] text-gray-500 italic leading-snug">
-                                    3D unsharp: original + strength × (original − Gaussian³).
+                                    3D unsharp in millimetres: anisotropic Gaussian (σ / voxel spacing on each axis), then original + strength × (original − blur).
                                 </div>
                             </>
                          )}
@@ -567,6 +558,17 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
                                         className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
                                     />
                                 </div>
+                                <label className="flex items-start gap-2 text-[10px] text-gray-400 cursor-pointer">
+                                    <input
+                                        type="checkbox"
+                                        checked={n4HighAccuracy}
+                                        onChange={(e) => setN4HighAccuracy(e.target.checked)}
+                                        className="mt-0.5 rounded bg-gray-700 border-gray-600 text-cyan-500 focus:ring-0"
+                                    />
+                                    <span>
+                                        High accuracy: extra spline level, and ITK-WASM N4 if <span className="font-mono">@itk-wasm/n4-bias-correction</span> is installed (otherwise the JS hierarchical N4).
+                                    </span>
+                                </label>
                                 <div className="text-[10px] text-gray-500 italic leading-snug">
                                     Hierarchical N4: Otsu mask, log-domain Wiener histogram sharpening, cubic B-spline bias field. Background is left unchanged.
                                 </div>
@@ -972,8 +974,24 @@ export const ProcessingPanel: React.FC<ProcessingPanelProps> = ({
                                 className="w-full py-2 bg-purple-900/40 border border-purple-800/50 hover:bg-purple-900/60 hover:border-purple-500 text-purple-300 text-xs rounded transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                             >
                                 {isProcessing ? <Loader2 className="animate-spin w-3 h-3"/> : <Cpu className="w-3 h-3" />}
-                                {isFetchingModels ? 'Loading Methods...' : 'Run Inference'}
+                                {isFetchingModels
+                                    ? 'Loading Methods...'
+                                    : isProcessing
+                                        ? `${progress}%${progressLabel ? ` ${progressLabel}` : ''}`
+                                        : 'Run Inference'}
                             </button>
+                            {isProcessing && (
+                                <button
+                                    type="button"
+                                    onClick={() => { cancelInferenceJob(); cancelVolumeJob(); setIsProcessing(false); setProgress(0); setProgressLabel(''); }}
+                                    className="w-full py-2 bg-gray-800 border border-gray-700 rounded text-xs text-red-300 hover:text-red-200"
+                                >
+                                    Cancel inference
+                                </button>
+                            )}
+                            <div className="text-[10px] text-gray-500 leading-snug">
+                                Prefers POST /jobs and polls GET /jobs/{'{id}'} (BACKEND_SPEC §12). Falls back to POST /predict. Progress is server-reported or download bytes — not a fake 10/30/60/100. 5-minute timeout.
+                            </div>
                         </div>
                     </div>
                  </div>

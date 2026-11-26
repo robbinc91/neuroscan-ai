@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { Sidebar } from './components/Sidebar';
 import { Viewport } from './components/Viewport';
 import { ProcessingPanel } from './components/ProcessingPanel';
@@ -8,14 +8,18 @@ import { ComparisonPanel, ComparisonMode } from './components/ComparisonPanel';
 import { SettingsDialog } from './components/SettingsDialog';
 import { MetadataSidebar } from './components/MetadataSidebar';
 import { ToolCategory, ViewMode, VolumeData, ViewportHandle, ViewportTool, Study, WindowLevel } from './types';
-import { Menu, Loader2, Layers, FolderInput, Settings, LayoutGrid, Box, Info, FileText, History, Download } from 'lucide-react';
-import { parseNiftiFile } from './utils/niftiUtils';
-import { parseVolumeFromFile, parseVolumeFromFiles } from './utils/loadVolume';
+import { Menu, Loader2, Layers, FolderInput, FolderOpen, Settings, LayoutGrid, Box, Info, FileText, History, Download } from 'lucide-react';
+import { dicomSeriesInFiles, isNiftiFileName, parseVolumeFromFileAsync, parseVolumeFromFilesAsync, type DicomSeriesChoice } from './utils/loadVolume';
+import { parseNiftiFileAsync, warmupNiftiParser } from './utils/niftiUtils';
+import { SeriesPickerDialog } from './components/SeriesPickerDialog';
+import { ToastHost } from './components/ToastHost';
+import { toast } from './utils/toasts';
 import { autoWindowLevel } from './utils/windowLevel';
 import { encodeNiftiGz } from './utils/niftiWrite';
 import {
     loadSessionPrefs,
     pushRecentFile,
+    saveAnonymizeExports,
     saveConvention,
     saveViewMode,
     saveWindowLevel,
@@ -26,8 +30,15 @@ import { ensureVolumeMetadata, patientFooterLabel } from './utils/volumeMetadata
 import {
     computeVolumeDifferenceWithGeometry,
     computeSegmentationDifference,
-    alignSegmentationToReferenceVolume
+    alignSegmentationToReferenceVolume,
+    alignVolumeToReference
 } from './utils/imageProcessing';
+
+function isTextEditingTarget(el: EventTarget | null): boolean {
+    if (!(el instanceof HTMLElement)) return false;
+    const tag = el.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+}
 
 const LAYOUT_OPTIONS: { id: ViewMode; label: string; shortcut: string }[] = [
     { id: ViewMode.FourUp, label: '4-Up', shortcut: '0' },
@@ -42,6 +53,12 @@ const App: React.FC = () => {
     const [viewMode, setViewMode] = useState<ViewMode>(ViewMode.FourUp);
 
     // Single Study State (Backwards Compatibility)
+    const [seriesPick, setSeriesPick] = useState<{
+        files: Array<{ name: string; path?: string; data: ArrayBuffer }>;
+        series: DicomSeriesChoice[];
+        recentPath?: string;
+        recentName?: string;
+    } | null>(null);
     const [volume, setVolume] = useState<VolumeData | null>(null);
     const [sourceVolume, setSourceVolume] = useState<VolumeData | null>(null);
     const [volumeHistory, setVolumeHistory] = useState<VolumeData[]>([]);
@@ -66,7 +83,9 @@ const App: React.FC = () => {
     const pendingWlRestoreRef = useRef<WindowLevel | null>(null);
     const [sessionReady, setSessionReady] = useState(false);
     const [paintUndoCount, setPaintUndoCount] = useState(0);
+    const [anonymizeExports, setAnonymizeExports] = useState(true);
     const [menuOpen, setMenuOpen] = useState(false);
+    const [appVersion, setAppVersion] = useState('');
 
     // Shared Position for Sync
     const [sharedPosition, setSharedPosition] = useState({ x: 128, y: 128, z: 128 });
@@ -101,6 +120,53 @@ const App: React.FC = () => {
         void pushRecentFile(filePath, name || filePath.split(/[\\/]/).pop() || 'scan').then(setRecentFiles);
     };
 
+    const ingestMedicalFiles = async (
+        files: Array<{ name: string; path?: string; data: ArrayBuffer }>,
+        recent?: { path?: string; name?: string }
+    ) => {
+        if (files.length === 0) {
+            toast('No DICOM or NIfTI files found.');
+            return;
+        }
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+        const nifti = files.filter((f) => isNiftiFileName(f.name));
+        if (nifti.length > 0) {
+            const parsed = await parseVolumeFromFileAsync(nifti[0].name, nifti[0].data);
+            if (parsed) {
+                loadVolume(parsed, nifti[0].name);
+                rememberRecent(nifti[0].path || recent?.path, nifti[0].name);
+            } else {
+                toast(`Failed to parse "${nifti[0].name}". Expected NIfTI (.nii, .nii.gz).`);
+            }
+            return;
+        }
+        const series = dicomSeriesInFiles(files);
+        if (series.length > 1) {
+            setSeriesPick({ files, series, recentPath: recent?.path, recentName: recent?.name || files[0].name });
+            return;
+        }
+        const parsed = await parseVolumeFromFilesAsync(files, series[0]?.uid);
+        if (parsed) {
+            loadVolume(parsed, files[0].name);
+            rememberRecent(files[0].path || recent?.path, recent?.name || files[0].name);
+        } else {
+            toast(`Failed to parse "${files[0].name}". Expected NIfTI (.nii, .nii.gz) or DICOM (.dcm, .ima).`);
+        }
+    };
+
+    const confirmSeries = async (uid: string) => {
+        if (!seriesPick) return;
+        const parsed = await parseVolumeFromFilesAsync(seriesPick.files, uid);
+        if (parsed) {
+            const picked = seriesPick.series.find((s) => s.uid === uid);
+            loadVolume(parsed, picked?.label || seriesPick.files[0].name);
+            rememberRecent(seriesPick.files[0].path || seriesPick.recentPath, seriesPick.recentName || seriesPick.files[0].name);
+        } else {
+            toast('Failed to reconstruct the selected DICOM series.');
+        }
+        setSeriesPick(null);
+    };
+
     const commitVolume = (next: VolumeData) => {
         const prev = volumeRef.current;
         if (prev && prev.data !== next.data) {
@@ -116,6 +182,13 @@ const App: React.FC = () => {
         setVolumeHistory(h.slice(0, -1));
         setVolume(prev);
     };
+
+    const performAppUndo = () => {
+        if (viewportRef.current?.undoPaint()) return;
+        undoVolume();
+    };
+    const performAppUndoRef = useRef(performAppUndo);
+    performAppUndoRef.current = performAppUndo;
 
     const resetVolume = () => {
         if (!sourceVolume) return;
@@ -145,7 +218,7 @@ const App: React.FC = () => {
     const handleFileUpload = async () => {
         // Check if running in Electron
         if (!window.electron) {
-            alert("This application must be run in Electron. Please build and run the desktop app.");
+            toast("This application must be run in Electron. Please build and run the desktop app.", 'warning');
             return;
         }
 
@@ -164,17 +237,31 @@ const App: React.FC = () => {
                 return;
             }
 
-            const parsedVolume = parseVolumeFromFiles(files);
-
-            if (parsedVolume) {
-                loadVolume(parsedVolume, files[0].name);
-                rememberRecent(files[0].path, files[0].name);
-            } else {
-                alert(`Failed to parse "${files[0].name}". Expected NIfTI (.nii, .nii.gz) or DICOM (.dcm, .ima).`);
-            }
+            await ingestMedicalFiles(files, { path: files[0].path, name: files[0].name });
         } catch (e) {
             console.error("File upload error:", e);
-            alert(`Error loading file(s): ${e instanceof Error ? e.message : 'Unknown error'}`);
+            toast(`Error loading file(s): ${e instanceof Error ? e.message : 'Unknown error'}`);
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    const handleFolderImport = async () => {
+        if (!window.electron) {
+            toast('Folder import is available in the desktop app.', 'warning');
+            return;
+        }
+        setIsLoading(true);
+        try {
+            const result = await window.electron.readMedicalFolder();
+            if (!result) return;
+            await ingestMedicalFiles(result.files, {
+                path: result.root,
+                name: result.root.split(/[\\/]/).pop() || 'folder'
+            });
+        } catch (e) {
+            console.error('Folder import error:', e);
+            toast(`Error loading folder: ${e instanceof Error ? e.message : 'Unknown error'}`);
         } finally {
             setIsLoading(false);
         }
@@ -183,7 +270,7 @@ const App: React.FC = () => {
     const handleSegmentationUpload = async () => {
         // Check if running in Electron
         if (!window.electron) {
-            alert("This application must be run in Electron. Please build and run the desktop app.");
+            toast("This application must be run in Electron. Please build and run the desktop app.", 'warning');
             return;
         }
 
@@ -202,12 +289,12 @@ const App: React.FC = () => {
                 return;
             }
 
-            const parsedVolume = parseNiftiFile(files[0].data);
+            const parsedVolume = await parseNiftiFileAsync(files[0].data);
             if (parsedVolume) setSegmentationVolume(parsedVolume);
-            else alert("Failed to parse Segmentation file.");
+            else toast("Failed to parse Segmentation file.");
         } catch (e) {
             console.error("Segmentation upload error:", e);
-            alert(`Error loading segmentation: ${e instanceof Error ? e.message : 'Unknown error'}`);
+            toast(`Error loading segmentation: ${e instanceof Error ? e.message : 'Unknown error'}`);
         } finally {
             setIsLoading(false);
         }
@@ -219,12 +306,7 @@ const App: React.FC = () => {
 
     const requestReportExport = () => {
         if (!volumeRef.current) {
-            alert('Load a scan before exporting a report.');
-            return;
-        }
-        if (!segmentationRef.current) {
-            setActiveTool(ToolCategory.Analysis);
-            alert('Load or create a segmentation before exporting a report.');
+            toast('Load a scan before exporting a report.', 'warning');
             return;
         }
         setActiveTool(ToolCategory.Analysis);
@@ -232,22 +314,22 @@ const App: React.FC = () => {
     };
 
     const lastOpenedKeyRef = useRef('');
-    const ingestOpenedFile = (file: { name: string; path: string; data: ArrayBuffer }, opts?: { force?: boolean }) => {
+    const ingestOpenedFile = async (file: { name: string; path: string; data: ArrayBuffer }, opts?: { force?: boolean }) => {
         const key = `${file.path}:${file.data.byteLength}`;
         if (!opts?.force && key === lastOpenedKeyRef.current) return;
         lastOpenedKeyRef.current = key;
         setIsLoading(true);
         try {
-            const parsedVolume = parseVolumeFromFile(file.name, file.data);
+            const parsedVolume = await parseVolumeFromFileAsync(file.name, file.data);
             if (parsedVolume) {
                 loadVolume(parsedVolume, file.name);
                 rememberRecent(file.path, file.name);
             } else {
-                alert(`Failed to parse "${file.name}". Expected NIfTI (.nii, .nii.gz) or DICOM (.dcm, .ima).`);
+                toast(`Failed to parse "${file.name}". Expected NIfTI (.nii, .nii.gz) or DICOM (.dcm, .ima).`);
             }
         } catch (e) {
             console.error('Error opening associated file:', e);
-            alert(`Error opening "${file.name}": ${e instanceof Error ? e.message : 'Unknown error'}`);
+            toast(`Error opening "${file.name}": ${e instanceof Error ? e.message : 'Unknown error'}`);
         } finally {
             setIsLoading(false);
         }
@@ -255,12 +337,12 @@ const App: React.FC = () => {
 
     const exportNifti = async (kind: 'volume' | 'seg') => {
         if (!window.electron) {
-            alert('Export is available in the desktop app.');
+            toast('Export is available in the desktop app.', 'warning');
             return;
         }
         const vol = kind === 'seg' ? segmentationRef.current : volumeRef.current;
         if (!vol) {
-            alert(kind === 'seg' ? 'Load or paint a segmentation before exporting.' : 'Load a scan before exporting.');
+            toast(kind === 'seg' ? 'Load or paint a segmentation before exporting.' : 'Load a scan before exporting.', 'warning');
             return;
         }
         try {
@@ -271,7 +353,7 @@ const App: React.FC = () => {
             await window.electron.saveFile(gz, defaultName, [{ name: 'NIfTI gzip', extensions: ['gz'] }]);
         } catch (e) {
             console.error(e);
-            alert(`Export failed: ${e instanceof Error ? e.message : 'Unknown error'}`);
+            toast(`Export failed: ${e instanceof Error ? e.message : 'Unknown error'}`);
         }
     };
 
@@ -281,13 +363,13 @@ const App: React.FC = () => {
         try {
             const file = await window.electron.readFileByPath(item.path);
             if (!file) {
-                alert(`Could not open "${item.path}". It may have been moved or deleted.`);
+                toast(`Could not open "${item.path}". It may have been moved or deleted.`);
                 return;
             }
-            ingestOpenedFile(file, { force: true });
+            await ingestOpenedFile(file, { force: true });
         } catch (e) {
             console.error(e);
-            alert(`Error opening "${item.name}": ${e instanceof Error ? e.message : 'Unknown error'}`);
+            toast(`Error opening "${item.name}": ${e instanceof Error ? e.message : 'Unknown error'}`);
         } finally {
             setIsLoading(false);
         }
@@ -299,6 +381,15 @@ const App: React.FC = () => {
     ingestOpenedFileRef.current = ingestOpenedFile;
     const exportNiftiRef = useRef(exportNifti);
     exportNiftiRef.current = exportNifti;
+    const handleFolderImportRef = useRef(handleFolderImport);
+    handleFolderImportRef.current = handleFolderImport;
+    const ingestMedicalFilesRef = useRef(ingestMedicalFiles);
+    ingestMedicalFilesRef.current = ingestMedicalFiles;
+
+    useEffect(() => {
+        void warmupNiftiParser();
+        void window.electron?.getAppVersion().then(setAppVersion);
+    }, []);
 
     // Electron menu event handlers
     useEffect(() => {
@@ -306,6 +397,10 @@ const App: React.FC = () => {
 
         const unsubscribeImportScan = window.electron.onMenuImportScan(() => {
             handleFileUpload();
+        });
+
+        const unsubscribeImportFolder = window.electron.onMenuImportFolder(() => {
+            void handleFolderImportRef.current();
         });
 
         const unsubscribeImportSeg = window.electron.onMenuImportSegmentation(() => {
@@ -328,6 +423,10 @@ const App: React.FC = () => {
             setSettingsOpen(true);
         });
 
+        const unsubscribeUndo = window.electron.onMenuUndo(() => {
+            performAppUndoRef.current();
+        });
+
         const unsubscribeViewMode = window.electron.onMenuSetViewMode((mode) => {
             if (Object.values(ViewMode).includes(mode as ViewMode)) {
                 setViewMode(mode as ViewMode);
@@ -335,20 +434,22 @@ const App: React.FC = () => {
         });
 
         const unsubscribeFileOpened = window.electron.onFileOpened((file) => {
-            ingestOpenedFileRef.current(file);
+            void ingestOpenedFileRef.current(file);
         });
 
         void window.electron.takePendingOpenFile().then((file) => {
-            if (file) ingestOpenedFileRef.current(file);
+            if (file) void ingestOpenedFileRef.current(file);
         });
 
         return () => {
             unsubscribeImportScan();
+            unsubscribeImportFolder();
             unsubscribeImportSeg();
             unsubscribeExportReport();
             unsubscribeExportVolume();
             unsubscribeExportSeg();
             unsubscribeOpenSettings();
+            unsubscribeUndo();
             unsubscribeViewMode();
             unsubscribeFileOpened();
         };
@@ -356,16 +457,11 @@ const App: React.FC = () => {
 
     useEffect(() => {
         const onKeyDown = (e: KeyboardEvent) => {
-            const target = e.target as HTMLElement | null;
-            if (target) {
-                const tag = target.tagName;
-                if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable) return;
-            }
+            if (isTextEditingTarget(e.target)) return;
             if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'z' || e.key === 'Z')) {
                 if (e.shiftKey) return;
                 e.preventDefault();
-                if (viewportRef.current?.undoPaint()) return;
-                undoVolume();
+                performAppUndoRef.current();
                 return;
             }
             if (e.ctrlKey || e.metaKey || e.altKey) return;
@@ -453,6 +549,7 @@ const App: React.FC = () => {
             if (prefs.windowLevel) pendingWlRestoreRef.current = prefs.windowLevel;
             if (prefs.convention) setDisplayConvention(prefs.convention);
             setRecentFiles(prefs.recentFiles);
+            setAnonymizeExports(prefs.anonymizeExports);
             setSessionReady(true);
         });
         return () => { cancelled = true; };
@@ -469,6 +566,11 @@ const App: React.FC = () => {
     }, [displayConvention, sessionReady]);
 
     useEffect(() => {
+        if (!sessionReady) return;
+        void saveAnonymizeExports(anonymizeExports);
+    }, [anonymizeExports, sessionReady]);
+
+    useEffect(() => {
         if (!sessionReady || !windowLevel) return;
         const t = window.setTimeout(() => { void saveWindowLevel(windowLevel); }, 400);
         return () => window.clearTimeout(t);
@@ -477,6 +579,22 @@ const App: React.FC = () => {
     useEffect(() => {
         if (!volume && cinePlaying) setCinePlaying(false);
     }, [volume, cinePlaying]);
+
+    useEffect(() => {
+        if (activeTool !== ToolCategory.Comparison) return;
+        if (!volume) return;
+        setStudies((prev) => {
+            if (prev.length > 0) return prev;
+            return [{
+                id: `baseline-${Date.now()}`,
+                name: volume.metadata?.sourceName || volume.metadata?.seriesDescription || 'Current scan',
+                volume,
+                segmentation: segmentationRef.current,
+                date: new Date(),
+                color: 'cyan'
+            }];
+        });
+    }, [activeTool, volume]);
 
     // Drag and drop support
     const [isDragging, setIsDragging] = useState(false);
@@ -509,23 +627,21 @@ const App: React.FC = () => {
 
             setIsLoading(true);
             try {
-                let parsedVolume: VolumeData | null = null;
-
                 const buffers = await Promise.all(
                     files.map(async (file) => ({ name: file.name, data: await file.arrayBuffer() }))
                 );
-                parsedVolume = parseVolumeFromFiles(buffers);
-
-                if (parsedVolume) {
-                    loadVolume(parsedVolume, files[0].name);
-                    const droppedPath = (files[0] as File & { path?: string }).path;
-                    rememberRecent(droppedPath, files[0].name);
-                } else {
-                    alert(`Failed to parse "${files[0].name}". Expected NIfTI (.nii, .nii.gz) or DICOM (.dcm, .ima).`);
-                }
+                const droppedPath = (files[0] as File & { path?: string }).path;
+                await ingestMedicalFilesRef.current(
+                    buffers.map((b, i) => ({
+                        name: b.name,
+                        path: (files[i] as File & { path?: string }).path,
+                        data: b.data
+                    })),
+                    { path: droppedPath, name: files[0].name }
+                );
             } catch (error) {
                 console.error('Error processing dropped files:', error);
-                alert("Error reading dropped file(s).");
+                toast("Error reading dropped file(s).");
             } finally {
                 setIsLoading(false);
             }
@@ -548,8 +664,9 @@ const App: React.FC = () => {
         const vDiff = computeVolumeDifferenceWithGeometry(studies[0].volume, studies[1].volume);
         const segFollow = alignSegmentationToReferenceVolume(studies[1].segmentation, studies[0].volume);
         if (studies[1].segmentation && !segFollow) {
-            alert(
-                'Follow-up segmentation could not be aligned to the baseline grid (missing geometry or resample failure). Segmentation difference was skipped.'
+            toast(
+                'Follow-up segmentation could not be aligned to the baseline grid (missing geometry or resample failure). Segmentation difference was skipped.',
+                'warning'
             );
         }
         const sDiff = computeSegmentationDifference(studies[0].segmentation, segFollow, studies[0].volume);
@@ -559,19 +676,37 @@ const App: React.FC = () => {
         setComparisonMode('difference');
     };
 
+    const swapStudies = () => {
+        setStudies((prev) => {
+            if (prev.length < 2) return prev;
+            return [
+                { ...prev[1], color: 'cyan' },
+                { ...prev[0], color: 'green' }
+            ];
+        });
+        setDiffVolume(null);
+        setDiffSeg(null);
+        setComparisonMode('split');
+    };
+
+    const overlayAligned = useMemo(() => {
+        if (studies.length < 2) return null;
+        return alignVolumeToReference(studies[1].volume, studies[0].volume);
+    }, [studies]);
+
     // Determine Viewport Content based on Mode
     const getComparisonViewportContent = () => {
         if (comparisonMode === 'difference') {
             return { volume: diffVolume || studies[1].volume, segmentation: diffSeg, colormap: 'hot-cold' as const };
         }
         if (comparisonMode === 'overlay') {
-            // In overlay mode, we show Baseline as base, and Followup as overlay
             return {
                 volume: studies[0].volume,
                 segmentation: null,
                 colormap: 'grayscale' as const,
-                overlayVolume: studies[1].volume,
-                overlayOpacity: overlayOpacity
+                overlayVolume: overlayAligned,
+                overlayOpacity: overlayOpacity,
+                overlayColormap: 'grayscale' as const
             };
         }
         // Default 'split': Show Follow-up in the secondary viewport
@@ -609,6 +744,8 @@ const App: React.FC = () => {
                         segmentation={segmentationVolume}
                         onGenerateReport={() => viewportRef.current?.getReportImages()}
                         exportRequestId={exportRequestId}
+                        anonymize={anonymizeExports}
+                        onAnonymizeChange={setAnonymizeExports}
                     />
                 );
             case ToolCategory.Reporting:
@@ -618,6 +755,8 @@ const App: React.FC = () => {
                         segmentation={segmentationVolume}
                         onGenerateReport={() => viewportRef.current?.getReportImages()}
                         onOpenSettings={() => setSettingsOpen(true)}
+                        anonymize={anonymizeExports}
+                        onAnonymizeChange={setAnonymizeExports}
                     />
                 );
             case ToolCategory.Comparison:
@@ -634,6 +773,12 @@ const App: React.FC = () => {
                             setDiffSeg(null);
                             setComparisonMode('split');
                         }}
+                        onUpdateStudy={(id, patch) => {
+                            setStudies((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s)));
+                            setDiffVolume(null);
+                            setDiffSeg(null);
+                        }}
+                        onSwapStudies={swapStudies}
                         comparisonMode={comparisonMode}
                         onSetComparisonMode={setComparisonMode}
                         overlayOpacity={overlayOpacity}
@@ -668,6 +813,7 @@ const App: React.FC = () => {
     return (
         <div className="flex flex-col h-screen w-screen bg-gray-950 text-gray-100 font-sans overflow-hidden">
             <SettingsDialog isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} />
+            <ToastHost />
 
             {/* Drag and Drop Overlay */}
             {isDragging && (
@@ -714,6 +860,15 @@ const App: React.FC = () => {
                                 <button
                                     type="button"
                                     role="menuitem"
+                                    className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-gray-200 hover:bg-gray-800"
+                                    onClick={() => { closeMenu(); void handleFolderImport(); }}
+                                >
+                                    <FolderOpen className="w-3.5 h-3.5 text-gray-400" />
+                                    Import Folder / DICOMDIR
+                                </button>
+                                <button
+                                    type="button"
+                                    role="menuitem"
                                     className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-40"
                                     disabled={!volume}
                                     onClick={() => { closeMenu(); handleSegmentationUpload(); }}
@@ -725,7 +880,7 @@ const App: React.FC = () => {
                                     type="button"
                                     role="menuitem"
                                     className="flex w-full items-center justify-between px-3 py-1.5 text-left text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-40"
-                                    disabled={!volume || !segmentationVolume}
+                                    disabled={!volume}
                                     onClick={() => { closeMenu(); requestReportExport(); }}
                                 >
                                     <span className="flex items-center gap-2">
@@ -817,7 +972,9 @@ const App: React.FC = () => {
                         )}
                     </div>
                     <h1 className="text-lg font-bold tracking-tight flex items-center gap-2"><span className="text-cyan-400">NeuroScan</span> AI</h1>
-                    <span className="bg-gray-800 text-xs px-2 py-0.5 rounded text-gray-400 border border-gray-700">v2.6-diff</span>
+                    {appVersion && (
+                        <span className="bg-gray-800 text-xs px-2 py-0.5 rounded text-gray-400 border border-gray-700">v{appVersion}</span>
+                    )}
                 </div>
                 <div className="flex items-center gap-0.5 bg-gray-800/80 rounded-lg p-0.5 border border-gray-700" role="tablist" aria-label="Viewport layout">
                     {LAYOUT_OPTIONS.map((opt) => {
@@ -848,6 +1005,10 @@ const App: React.FC = () => {
                             <button onClick={handleFileUpload} className="flex items-center gap-2 bg-gray-800 hover:bg-gray-700 text-sm px-3 py-1.5 rounded transition-colors border border-gray-700 disabled:opacity-50" disabled={isLoading}>
                                 {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <FolderInput className="w-4 h-4" />}
                                 <span>Import Scan</span>
+                            </button>
+                            <button onClick={() => void handleFolderImport()} className="flex items-center gap-2 bg-gray-800 hover:bg-gray-700 text-sm px-3 py-1.5 rounded transition-colors border border-gray-700 disabled:opacity-50" disabled={isLoading} title="Import a folder or DICOMDIR">
+                                <FolderOpen className="w-4 h-4" />
+                                <span>Folder</span>
                             </button>
                             <button onClick={handleSegmentationUpload} className="flex items-center gap-2 bg-gray-800 hover:bg-gray-700 text-sm px-3 py-1.5 rounded transition-colors border border-gray-700 disabled:opacity-50" disabled={isLoading || !volume}>
                                 {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Layers className="w-4 h-4 text-green-400" />}
@@ -1000,6 +1161,13 @@ const App: React.FC = () => {
                     </div>
                 </aside>
             </div>
+            {seriesPick && (
+                <SeriesPickerDialog
+                    series={seriesPick.series}
+                    onPick={confirmSeries}
+                    onCancel={() => setSeriesPick(null)}
+                />
+            )}
         </div>
     );
 };

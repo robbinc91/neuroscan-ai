@@ -1,4 +1,5 @@
 import type { VolumeData } from '../types';
+import { tryItkWasmN4 } from './n4ItkWasm';
 
 /**
  * Hierarchical N4-style bias field correction (Tustison 2010; N3 residual step from Sled 1998).
@@ -21,6 +22,8 @@ export interface N4Options {
     iterationsPerLevel?: number;
     /** Number of coarse-to-fine spline levels. Default 3. */
     numberOfLevels?: number;
+    /** Extra spline level + try ITK-WASM N4 if that package is installed. */
+    highAccuracy?: boolean;
     /** Histogram Gaussian FWHM in log-intensity units. Default 0.15. */
     fwhm?: number;
     /** Wiener noise term. Default 0.01. */
@@ -53,7 +56,18 @@ export async function correctN4BiasField(
 ): Promise<N4Result> {
     const meshSpacingMm = clamp(options.meshSpacingMm ?? 50, 15, 150);
     const iterationsPerLevel = Math.max(1, Math.round(options.iterationsPerLevel ?? 8));
-    const numberOfLevels = Math.max(1, Math.min(4, Math.round(options.numberOfLevels ?? 3)));
+    const numberOfLevels = Math.max(1, Math.min(4, Math.round(options.numberOfLevels ?? (options.highAccuracy ? 4 : 3))));
+
+    if (options.highAccuracy) {
+        const itk = await tryItkWasmN4(volume, {
+            meshSpacingMm,
+            iterationsPerLevel,
+            fwhm: options.fwhm,
+            wienerNoise: options.wienerNoise,
+            convergenceThreshold: options.convergenceThreshold
+        }, onProgress);
+        if (itk) return itk;
+    }
     const fwhm = options.fwhm ?? 0.15;
     const wienerNoise = options.wienerNoise ?? 0.01;
     const convergenceThreshold = options.convergenceThreshold ?? 0.001;

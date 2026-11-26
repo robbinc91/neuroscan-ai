@@ -10,7 +10,7 @@ function applyMat4Point(m: number[], x: number, y: number, z: number): [number, 
     ];
 }
 
-function readVoxel(
+export function readVoxel(
     data: Float32Array | Int16Array | Uint8Array | Int32Array | Float64Array | Uint16Array,
     nx: number,
     ny: number,
@@ -23,7 +23,7 @@ function readVoxel(
     return data[ix + iy * nx + iz * nx * ny];
 }
 
-function sampleTrilinear(
+export function sampleTrilinear(
     data: Float32Array | Int16Array | Uint8Array | Int32Array | Float64Array | Uint16Array,
     nx: number,
     ny: number,
@@ -60,7 +60,7 @@ function sampleTrilinear(
     return c0 * (1 - tz) + c1 * tz;
 }
 
-function sampleNearest(
+export function sampleNearest(
     data: Float32Array | Int16Array | Uint8Array | Int32Array | Float64Array | Uint16Array,
     nx: number,
     ny: number,

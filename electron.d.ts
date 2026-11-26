@@ -13,6 +13,10 @@ export interface ElectronAPI {
         filters?: { name: string; extensions: string[] }[]
     ) => Promise<string | null>;
     selectDirectory: () => Promise<string | null>;
+    readMedicalFolder: (dirPath?: string) => Promise<{
+        root: string;
+        files: Array<{ name: string; path: string; data: ArrayBuffer }>;
+    } | null>;
     writeBundle: (
         directoryPath: string,
         files: Array<{
@@ -35,12 +39,14 @@ export interface ElectronAPI {
 
     // Menu event listeners
     onMenuImportScan: (callback: () => void) => () => void;
+    onMenuImportFolder: (callback: () => void) => () => void;
     onMenuImportSegmentation: (callback: () => void) => () => void;
     onMenuExportReport: (callback: () => void) => () => void;
     onMenuExportVolume: (callback: () => void) => () => void;
     onMenuExportSegmentation: (callback: () => void) => () => void;
     readFileByPath: (filePath: string) => Promise<{ name: string; path: string; data: ArrayBuffer } | null>;
     onMenuOpenSettings: (callback: () => void) => () => void;
+    onMenuUndo: (callback: () => void) => () => void;
     onMenuSetViewMode: (callback: (mode: string) => void) => () => void;
 
     // File association handler

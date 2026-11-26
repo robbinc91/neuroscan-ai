@@ -4,8 +4,8 @@
   "version": "1.0.0",
   "type": "module",
   "main": "dist-electron/main.js",
-  "description": "Advanced MRI Analysis Desktop Application",
-  "author": "Your Name",
+  "description": "Desktop MRI/NIfTI/DICOM viewer with local processing and optional Gemini drafts",
+  "author": "robbinc91",
   "scripts": {
     "dev": "vite",
     "build": "cross-env NODE_OPTIONS=--max-old-space-size=4096 vite build && electron-builder",

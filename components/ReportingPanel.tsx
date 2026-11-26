@@ -5,13 +5,17 @@ import { VolumeData, SegmentationStats, ReportImages } from '../types';
 import { generateRadiologyReport, hasGeminiApiKey, RadiologyReportContext } from '../services/geminiService';
 import { computeSegmentationStats } from '../utils/segmentationStats';
 import { jpegDataUrlSize } from '../utils/reportImages';
-import { voxelSpacingMm } from '../utils/volumeMetadata';
+import { ensureVolumeMetadata, voxelSpacingMm } from '../utils/volumeMetadata';
+import { reportPatientLine } from '../utils/reportPhi';
+import { toast } from '../utils/toasts';
 
 interface ReportingPanelProps {
     volume: VolumeData | null;
     segmentation: VolumeData | null;
     onGenerateReport?: () => Promise<ReportImages | undefined>;
     onOpenSettings?: () => void;
+    anonymize?: boolean;
+    onAnonymizeChange?: (value: boolean) => void;
 }
 
 function examContextFromVolume(volume: VolumeData): RadiologyReportContext {
@@ -27,7 +31,9 @@ export const ReportingPanel: React.FC<ReportingPanelProps> = ({
     volume,
     segmentation,
     onGenerateReport,
-    onOpenSettings
+    onOpenSettings,
+    anonymize = true,
+    onAnonymizeChange
 }) => {
     const [stats, setStats] = useState<SegmentationStats[]>([]);
     const [labelMapping, setLabelMapping] = useState<Record<string, string>>({});
@@ -64,16 +70,16 @@ export const ReportingPanel: React.FC<ReportingPanelProps> = ({
         try {
             const mapping = JSON.parse(await file.text());
             if (mapping && typeof mapping === 'object') setLabelMapping(mapping);
-            else alert('Invalid JSON format. Expected key-value pairs.');
+            else toast('Invalid JSON format. Expected key-value pairs.');
         } catch {
-            alert('Failed to parse JSON.');
+            toast('Failed to parse JSON.');
         }
         if (jsonInputRef.current) jsonInputRef.current.value = '';
     };
 
     const handleGenerate = async () => {
         if (!volume || stats.length === 0) {
-            alert('Compute segmentation statistics before generating findings.');
+            toast('Compute segmentation statistics before generating findings.', 'warning');
             return;
         }
         setAiBusy(true);
@@ -83,7 +89,7 @@ export const ReportingPanel: React.FC<ReportingPanelProps> = ({
             setHasKey(await hasGeminiApiKey());
         } catch (err) {
             console.error(err);
-            alert('Failed to generate findings.');
+            toast('Failed to generate findings.');
         } finally {
             setAiBusy(false);
         }
@@ -111,11 +117,11 @@ export const ReportingPanel: React.FC<ReportingPanelProps> = ({
 
     const handleExportPdf = async () => {
         if (!volume || !window.electron) {
-            alert('Report export requires a loaded scan in the desktop app.');
+            toast('Report export requires a loaded scan in the desktop app.', 'warning');
             return;
         }
         if (!findings.trim()) {
-            alert('Generate or type findings before exporting.');
+            toast('Generate or type findings before exporting.', 'warning');
             return;
         }
         setExporting(true);
@@ -135,7 +141,12 @@ export const ReportingPanel: React.FC<ReportingPanelProps> = ({
             doc.text('NeuroScan AI — Radiology Draft', margin, 22);
             doc.setFontSize(9);
             doc.setTextColor(148, 163, 184);
-            doc.text(`Exported ${new Date().toLocaleString()}  ·  De-identified (no patient name or ID)`, margin, 30);
+            const meta = ensureVolumeMetadata(volume);
+            doc.text(
+                `Exported ${new Date().toLocaleString()}  ·  ${reportPatientLine(meta, anonymize)}`,
+                margin,
+                30
+            );
             const exam = examContextFromVolume(volume);
             const [dx, dy, dz] = exam.dimensions;
             const [sx, sy, sz] = exam.spacingMm;
@@ -229,7 +240,7 @@ export const ReportingPanel: React.FC<ReportingPanelProps> = ({
             ]);
         } catch (err) {
             console.error(err);
-            alert('Error exporting radiology draft PDF.');
+            toast('Error exporting radiology draft PDF.');
         } finally {
             setExporting(false);
         }
@@ -249,6 +260,15 @@ export const ReportingPanel: React.FC<ReportingPanelProps> = ({
 
     return (
         <div className="h-full flex flex-col p-4 gap-4 overflow-y-auto">
+            <label className="flex items-center justify-between gap-2 text-[11px] text-gray-300 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2">
+                <span>Anonymize exports (omit name and ID)</span>
+                <input
+                    type="checkbox"
+                    checked={anonymize}
+                    onChange={(e) => onAnonymizeChange?.(e.target.checked)}
+                    className="accent-cyan-500"
+                />
+            </label>
             <div>
                 <div className="flex justify-between items-end mb-2">
                     <h3 className="text-sm font-semibold text-gray-200 uppercase tracking-wider">Computed volumetry</h3>

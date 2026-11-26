@@ -6,7 +6,7 @@
 export async function gaussianSmooth3D(
     data: ArrayLike<number>,
     dimensions: [number, number, number],
-    sigmaVoxels: number,
+    sigmaVoxels: number | [number, number, number],
     onProgress?: (pct: number) => void | Promise<void>
 ): Promise<Float32Array> {
     const [width, height, depth] = dimensions;
@@ -15,16 +15,17 @@ export async function gaussianSmooth3D(
         throw new Error('Gaussian: volume length does not match dimensions');
     }
 
-    const sigma = Math.max(0.15, sigmaVoxels);
-    const kernel = gaussianKernel(sigma);
+    const [sx, sy, sz] = Array.isArray(sigmaVoxels)
+        ? [Math.max(0.15, sigmaVoxels[0]), Math.max(0.15, sigmaVoxels[1]), Math.max(0.15, sigmaVoxels[2])]
+        : [Math.max(0.15, sigmaVoxels), Math.max(0.15, sigmaVoxels), Math.max(0.15, sigmaVoxels)];
     const src = new Float32Array(len);
     src.set(data as ArrayLike<number>);
     const tmp = new Float32Array(len);
     const dst = new Float32Array(len);
 
-    await convolveAxis(src, tmp, width, height, depth, 'x', kernel, onProgress, 0, 33);
-    await convolveAxis(tmp, dst, width, height, depth, 'y', kernel, onProgress, 33, 66);
-    await convolveAxis(dst, tmp, width, height, depth, 'z', kernel, onProgress, 66, 100);
+    await convolveAxis(src, tmp, width, height, depth, 'x', gaussianKernel(sx), onProgress, 0, 33);
+    await convolveAxis(tmp, dst, width, height, depth, 'y', gaussianKernel(sy), onProgress, 33, 66);
+    await convolveAxis(dst, tmp, width, height, depth, 'z', gaussianKernel(sz), onProgress, 66, 100);
     return tmp;
 }
 

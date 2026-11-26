@@ -14,7 +14,23 @@ import {
     sliceUvToVoxelIndex
 } from '../utils/measure';
 import { canvasToJpegDataUrl, captureWebglJpeg, pickSnapshotIndices } from '../utils/reportImages';
-import { sliceFlipH, sliceSideLabels, type DisplayConvention } from '../utils/orientation';
+import { patientLetter, sliceFlipH, sliceSideLabels, type DisplayConvention } from '../utils/orientation';
+import {
+    buildMprPlane,
+    mprMeasurementMm,
+    mprPatientAt,
+    mprUvToVoxel,
+    mprUvToVoxelContinuous,
+    samplePatientLabel,
+    samplePatientScalar,
+    setAnatomicalSlice,
+    stepAnatomicalSlice,
+    voxelToMprUv,
+    type MprPlane
+} from '../utils/anatomicalMpr';
+import { displayWorldToTexColumnMajor } from '../utils/affineBox';
+import { transformPoint } from '../utils/mat4';
+import { sampleNearest } from '../utils/resampleVolume';
 
 interface ViewportProps {
     viewMode: ViewMode;
@@ -73,11 +89,16 @@ interface SliceViewerProps {
     windowLevel?: WindowLevel;
     onWindowLevelChange?: (wl: WindowLevel) => void;
     onActivate?: () => void;
+    mpr?: MprPlane | null;
+    voxelPos?: { x: number; y: number; z: number };
+    onVoxelPosChange?: (pos: { x: number; y: number; z: number }) => void;
 }
 
 interface Volume3DViewerProps {
     volume: VolumeData | null;
     segmentation?: VolumeData | null;
+    overlayVolume?: VolumeData | null;
+    overlayOpacity?: number;
     crosshair: { x: number, y: number, z: number };
     onDoubleClickLayout?: () => void;
     windowLevel?: WindowLevel;
@@ -234,6 +255,86 @@ export const generateSliceBitmap = (
     return canvas;
 };
 
+const generateMprSliceBitmap = (
+    volume: VolumeData,
+    segmentation: VolumeData | null,
+    plane: MprPlane,
+    colormap: 'grayscale' | 'hot-cold' = 'grayscale',
+    windowLevel?: WindowLevel
+): HTMLCanvasElement | null => {
+    const { min, max } = volume;
+    const { width, height } = plane;
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+
+    const imgData = ctx.createImageData(width, height);
+    const buf32 = new Uint32Array(imgData.data.buffer);
+    let scale = 1, offset = 0;
+    if (colormap === 'hot-cold') {
+        const absMax = Math.max(Math.abs(min), Math.abs(max)) || 1;
+        scale = 127 / absMax;
+    } else if (windowLevel) {
+        const { lo, hi } = windowBounds(windowLevel);
+        offset = lo;
+        scale = 255 / (hi - lo || 1);
+    } else {
+        const range = (max - min) || 1;
+        scale = 255 / range;
+        offset = min;
+    }
+
+    const useDiffPalette = colormap === 'hot-cold' && segmentation && segmentation.max <= 3 && segmentation.max > 0;
+    const BLEND_BG = 154, BLEND_FG = 102;
+    let pixelIdx = 0;
+    for (let v = 0; v < height; v++) {
+        for (let u = 0; u < width; u++) {
+            const patient = mprPatientAt(plane, u, v);
+            const rawVal = samplePatientScalar(volume, patient);
+            const ijk = transformPoint(plane.invAffine, patient[0], patient[1], patient[2]);
+            let r = 0, g = 0, b = 0;
+            if (colormap === 'hot-cold') {
+                if (rawVal > 0) {
+                    r = Math.min(255, rawVal * scale * 2);
+                    if (r > 200) g = (r - 200) * 2;
+                } else if (rawVal < 0) {
+                    b = Math.min(255, -rawVal * scale * 2);
+                    if (b > 200) g = (b - 200) * 2;
+                }
+            } else {
+                let val = (rawVal - offset) * scale;
+                if (val > 255) val = 255; else if (val < 0) val = 0;
+                r = val; g = val; b = val;
+            }
+            const segVal = segmentation
+                ? (segmentation.affine && segmentation.affine.length >= 16
+                    ? samplePatientLabel(segmentation, patient)
+                    : sampleNearest(segmentation.data, volume.dimensions[0], volume.dimensions[1], volume.dimensions[2], ijk[0], ijk[1], ijk[2]))
+                : 0;
+            if (segVal > 0) {
+                let rOv = 0, gOv = 0, bOv = 0;
+                if (useDiffPalette) {
+                    const c = DIFF_SEG_PALETTE[segVal] || [255, 255, 255];
+                    rOv = c[0]; gOv = c[1]; bOv = c[2];
+                } else {
+                    const lutIdx = segVal * 3;
+                    rOv = PALETTE_LUT[lutIdx];
+                    gOv = PALETTE_LUT[lutIdx + 1];
+                    bOv = PALETTE_LUT[lutIdx + 2];
+                }
+                r = (r * BLEND_BG + rOv * BLEND_FG) >> 8;
+                g = (g * BLEND_BG + gOv * BLEND_FG) >> 8;
+                b = (b * BLEND_BG + bOv * BLEND_FG) >> 8;
+            }
+            buf32[pixelIdx++] = 0xFF000000 | (b << 16) | (g << 8) | r;
+        }
+    }
+    ctx.putImageData(imgData, 0, 0);
+    return canvas;
+};
+
 // --- WEBGL UTILS ---
 
 const compileShader = (gl: WebGL2RenderingContext, type: number, source: string) => {
@@ -312,6 +413,7 @@ precision highp sampler3D;
 in vec2 v_uv;
 uniform sampler3D u_volume;
 uniform mediump sampler3D u_segmentation;
+uniform sampler3D u_overlay;
 uniform vec3 u_dims;
 uniform mat4 u_invViewRot;
 uniform float u_zoom;
@@ -320,19 +422,22 @@ uniform float u_opacity;
 uniform float u_threshold;
 uniform int u_mode; // 0: Scatter, 1: MIP, 2: Surface
 uniform bool u_hasSeg;
+uniform bool u_hasOverlay;
+uniform float u_overlayOpacity;
+uniform vec2 u_overlayRange;
 uniform vec3 u_lightDir;
 uniform float u_stepSize; // Dynamic step size for performance
-uniform vec3 u_boxSize;   // Physical aspect ratio box size
+uniform mat4 u_worldToTex; // Display-world → texture [0,1]^3 (affine OBB)
 uniform vec2 u_dataRange; // Min/Max for windowing
 
 out vec4 outColor;
 
 const int MAX_STEPS = 512; 
 
-// Intersect box centered at 0 with size u_boxSize
+// Intersect the unit cube in texture space (true affine OBB)
 vec2 intersectBox(vec3 orig, vec3 dir) {
-    vec3 boxMin = -u_boxSize * 0.5;
-    vec3 boxMax = u_boxSize * 0.5;
+    vec3 boxMin = vec3(0.0);
+    vec3 boxMax = vec3(1.0);
     vec3 invDir = 1.0 / dir;
     vec3 tmin0 = (boxMin - orig) * invDir;
     vec3 tmax0 = (boxMax - orig) * invDir;
@@ -390,24 +495,22 @@ void main() {
 
     vec3 ro_world = (u_invViewRot * vec4(ro, 1.0)).xyz;
     vec3 rd_world = mat3(u_invViewRot) * rd;
+    vec3 ro_tex = (u_worldToTex * vec4(ro_world, 1.0)).xyz;
+    vec3 rd_tex = mat3(u_worldToTex) * rd_world;
 
-    vec2 t_hit = intersectBox(ro_world, rd_world);
+    vec2 t_hit = intersectBox(ro_tex, rd_tex);
     if (t_hit.x > t_hit.y) discard;
     
     float t = max(t_hit.x, 0.0);
     
     vec4 acc = vec4(0.0);
     float maxVal = 0.0;
+    float overlayMax = 0.0;
     
     for(int i=0; i<MAX_STEPS; i++) {
         if (t > t_hit.y || acc.a >= 0.95) break;
 
-        vec3 pos = ro_world + t * rd_world;
-        
-        // Map Physical Box Position to 0..1 Texture Space
-        // pos is -boxSize/2 .. boxSize/2
-        // texCoord = (pos / u_boxSize) + 0.5
-        vec3 texCoord = (pos / u_boxSize) + 0.5;
+        vec3 texCoord = ro_tex + t * rd_tex;
 
         // Ensure we don't sample outside (clamp handled by texture params usually, but safe guard)
         if(any(lessThan(texCoord, vec3(0.0))) || any(greaterThan(texCoord, vec3(1.0)))) {
@@ -424,10 +527,19 @@ void main() {
         float seg = 0.0;
         if (u_hasSeg) seg = texture(u_segmentation, texCoord).r;
 
+        vec3 col = vec3(val);
+        if (u_hasOverlay) {
+            float oRaw = texture(u_overlay, texCoord).r;
+            float oDen = max(u_overlayRange.y - u_overlayRange.x, 1e-6);
+            float oVal = clamp((oRaw - u_overlayRange.x) / oDen, 0.0, 1.0);
+            overlayMax = max(overlayMax, oVal);
+            col = mix(col, vec3(oVal, oVal * 0.3, 1.0), u_overlayOpacity);
+        }
+
         if (u_mode == 2) {
             if (seg > 0.001) {
                 vec3 col = getSegColor(seg);
-                vec3 normal = getNormal(pos, texCoord);
+                vec3 normal = getNormal(texCoord, texCoord);
                 // Simple lighting
                 if (length(normal) < 0.1) normal = -rd_world; 
                 float diffuse = max(dot(normal, u_lightDir), 0.2);
@@ -441,7 +553,6 @@ void main() {
             if (val > (u_threshold / 255.0)) {
                 float alpha = (val - (u_threshold/255.0)) * u_opacity * 5.0;
                 alpha = alpha * (u_stepSize / 0.004); 
-                vec3 col = vec3(val);
                 acc.rgb += (1.0 - acc.a) * col * alpha;
                 acc.a += (1.0 - acc.a) * alpha;
             }
@@ -454,7 +565,9 @@ void main() {
 
     if (u_mode == 1) {
         if (maxVal < (u_threshold/255.0)) discard;
-        outColor = vec4(vec3(maxVal), 1.0);
+        vec3 mipCol = vec3(maxVal);
+        if (u_hasOverlay) mipCol = mix(mipCol, vec3(overlayMax, overlayMax * 0.3, 1.0), u_overlayOpacity);
+        outColor = vec4(mipCol, 1.0);
     } else {
         if (acc.a < 0.01) discard;
         outColor = acc;
@@ -502,7 +615,8 @@ const SliceViewer: React.FC<SliceViewerProps> = ({
     tool, brushSize, brushLabel = 1, onDraw, onPaintStrokeStart,
     colormap, opacity, overlayVolume, overlayOpacity, overlayColormap,
     onDoubleClickLayout, measurements, onCommitMeasurement,
-    windowLevel, onWindowLevelChange, onActivate, flipH = false
+    windowLevel, onWindowLevelChange, onActivate, flipH = false,
+    mpr = null, voxelPos, onVoxelPosChange
 }) => {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
@@ -526,17 +640,24 @@ const SliceViewer: React.FC<SliceViewerProps> = ({
             baseCanvasRef.current = null;
             return;
         }
-        const baseBitmap = generateSliceBitmap(volume, segmentation, orientation, slice, colormap, opacity, windowLevel, flipH);
+        const baseBitmap = mpr
+            ? generateMprSliceBitmap(volume, segmentation, mpr, colormap, windowLevel)
+            : generateSliceBitmap(volume, segmentation, orientation, slice, colormap, opacity, windowLevel, flipH);
         if (!baseBitmap) {
             baseCanvasRef.current = null;
             return;
         }
         if (overlayVolume) {
-            const overlayBitmap = generateSliceBitmap(
-                overlayVolume, null, orientation, slice, overlayColormap || 'hot-cold', overlayOpacity,
-                overlayColormap === 'grayscale' ? windowLevel : undefined,
-                flipH
-            );
+            const overlayBitmap = mpr
+                ? generateMprSliceBitmap(
+                    overlayVolume, null, mpr, overlayColormap || 'hot-cold',
+                    overlayColormap === 'grayscale' ? windowLevel : undefined
+                )
+                : generateSliceBitmap(
+                    overlayVolume, null, orientation, slice, overlayColormap || 'hot-cold', overlayOpacity,
+                    overlayColormap === 'grayscale' ? windowLevel : undefined,
+                    flipH
+                );
             if (overlayBitmap) {
                 const bctx = baseBitmap.getContext('2d');
                 if (bctx) {
@@ -547,7 +668,7 @@ const SliceViewer: React.FC<SliceViewerProps> = ({
             }
         }
         baseCanvasRef.current = baseBitmap;
-    }, [volume, segmentation, orientation, slice, colormap, opacity, overlayVolume, overlayOpacity, overlayColormap, windowLevel, flipH]);
+    }, [volume, segmentation, orientation, slice, colormap, opacity, overlayVolume, overlayOpacity, overlayColormap, windowLevel, flipH, mpr]);
 
     useEffect(() => {
         const canvas = canvasRef.current;
@@ -564,7 +685,9 @@ const SliceViewer: React.FC<SliceViewerProps> = ({
         ctx.drawImage(base, 0, 0);
 
         if (isActive && tool !== 'measure') {
-            const disp = inPlaneVoxelToDisplayUv(orientation, crosshair.x, crosshair.y, volume.dimensions, flipH);
+            const disp = mpr && voxelPos
+                ? voxelToMprUv(volume, mpr, voxelPos.x, voxelPos.y, voxelPos.z)
+                : inPlaneVoxelToDisplayUv(orientation, crosshair.x, crosshair.y, volume.dimensions, flipH);
             ctx.strokeStyle = color;
             ctx.lineWidth = 0.5;
             ctx.beginPath();
@@ -579,15 +702,17 @@ const SliceViewer: React.FC<SliceViewerProps> = ({
         const visible = (measurements ?? []).filter(
             (m) => m.orientation === orientation && m.slice === sliceIdx
         );
+        const lengthOf = (start: { u: number; v: number }, end: { u: number; v: number }) =>
+            mpr
+                ? mprMeasurementMm(mpr, start, end)
+                : measurementLengthMm(volume, orientation, sliceIdx, start, end, flipH);
         for (const m of visible) {
-            const mm = measurementLengthMm(volume, orientation, sliceIdx, m.start, m.end, flipH);
-            drawRuler(ctx, m.start, m.end, formatLengthMm(mm), '#22d3ee');
+            drawRuler(ctx, m.start, m.end, formatLengthMm(lengthOf(m.start, m.end)), '#22d3ee');
         }
         if (draft) {
-            const mm = measurementLengthMm(volume, orientation, sliceIdx, draft.start, draft.end, flipH);
-            drawRuler(ctx, draft.start, draft.end, formatLengthMm(mm), '#fde047');
+            drawRuler(ctx, draft.start, draft.end, formatLengthMm(lengthOf(draft.start, draft.end)), '#fde047');
         }
-    }, [volume, orientation, slice, crosshair, isActive, color, tool, measurements, draft, segmentation, colormap, opacity, overlayVolume, overlayOpacity, overlayColormap, windowLevel, flipH]);
+    }, [volume, orientation, slice, crosshair, isActive, color, tool, measurements, draft, segmentation, colormap, opacity, overlayVolume, overlayOpacity, overlayColormap, windowLevel, flipH, mpr, voxelPos]);
 
     useEffect(() => {
         if (tool !== 'measure') {
@@ -619,6 +744,11 @@ const SliceViewer: React.FC<SliceViewerProps> = ({
 
     const emitCrosshairFromDisplay = (u: number, v: number) => {
         if (!volume) return;
+        if (mpr && onVoxelPosChange) {
+            const [x, y, z] = mprUvToVoxelContinuous(volume, mpr, u, v);
+            onVoxelPosChange({ x, y, z });
+            return;
+        }
         const [vx, vy, vz] = sliceUvToVoxelIndex(orientation, u, v, slice, volume.dimensions, flipH);
         if (orientation === 'Axial') onCrosshairChange(vx, vy);
         else if (orientation === 'Coronal') onCrosshairChange(vx, vz);
@@ -799,7 +929,9 @@ const SliceViewer: React.FC<SliceViewerProps> = ({
         if (!isDragging && e.buttons !== 1) return;
         const hit = hitFromEvent(e);
         if (!hit || !volume) return;
-        const [vx, vy, vz] = sliceUvToVoxelIndex(orientation, hit.u, hit.v, slice, volume.dimensions, flipH);
+        const [vx, vy, vz] = mpr
+            ? mprUvToVoxel(volume, mpr, hit.u, hit.v)
+            : sliceUvToVoxelIndex(orientation, hit.u, hit.v, slice, volume.dimensions, flipH);
 
         if (tool === 'brush' || tool === 'eraser') {
             onDraw?.(vx, vy, vz, tool === 'brush' ? brushLabel : 0, brushSize);
@@ -824,7 +956,14 @@ const SliceViewer: React.FC<SliceViewerProps> = ({
         }
     };
 
-    const labels = sliceSideLabels(orientation, volume, flipH);
+    const labels = mpr
+        ? {
+            left: patientLetter(-mpr.uDir[0], -mpr.uDir[1], -mpr.uDir[2], volume?.coordSystem),
+            right: patientLetter(mpr.uDir[0], mpr.uDir[1], mpr.uDir[2], volume?.coordSystem),
+            top: patientLetter(-mpr.vDir[0], -mpr.vDir[1], -mpr.vDir[2], volume?.coordSystem),
+            bottom: patientLetter(mpr.vDir[0], mpr.vDir[1], mpr.vDir[2], volume?.coordSystem)
+        }
+        : sliceSideLabels(orientation, volume, flipH);
     const cursor =
         tool === 'pan' ? 'cursor-move'
         : tool === 'zoom' ? 'cursor-ns-resize'
@@ -845,7 +984,11 @@ const SliceViewer: React.FC<SliceViewerProps> = ({
             {tool === 'measure' && volume && (
                 <div className="absolute top-2 right-2 text-[10px] font-mono text-cyan-300/90 pointer-events-none z-10">
                     {draft
-                        ? formatLengthMm(measurementLengthMm(volume, orientation, displayedSliceIndex(slice), draft.start, draft.end, flipH))
+                        ? formatLengthMm(
+                            mpr
+                                ? mprMeasurementMm(mpr, draft.start, draft.end)
+                                : measurementLengthMm(volume, orientation, displayedSliceIndex(slice), draft.start, draft.end, flipH)
+                        )
                         : 'Drag · Shift axis-lock'}
                 </div>
             )}
@@ -914,7 +1057,7 @@ const SliceViewer: React.FC<SliceViewerProps> = ({
     );
 };
 
-const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerProps>(({ volume, segmentation, crosshair, onDoubleClickLayout, windowLevel }, ref) => {
+const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerProps>(({ volume, segmentation, overlayVolume, overlayOpacity = 0.5, crosshair, onDoubleClickLayout, windowLevel }, ref) => {
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
     const setCanvasRef = useCallback(
         (el: HTMLCanvasElement | null) => {
@@ -965,6 +1108,11 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
     const programRef = useRef<WebGLProgram | null>(null);
     const volTexRef = useRef<WebGLTexture | null>(null);
     const segTexRef = useRef<WebGLTexture | null>(null);
+    const overlayTexRef = useRef<WebGLTexture | null>(null);
+    const overlayVolRef = useRef<VolumeData | null | undefined>(overlayVolume);
+    overlayVolRef.current = overlayVolume;
+    const overlayOpacityRef = useRef(overlayOpacity);
+    overlayOpacityRef.current = overlayOpacity;
     const vaoRef = useRef<WebGLVertexArrayObject | null>(null);
 
     const syncUiFromRefs = useCallback(() => {
@@ -1061,6 +1209,16 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
         }
     }, [segmentation, updateSettings, windowing.p10, windowing.p35]);
 
+    useEffect(() => {
+        const gl = glRef.current;
+        if (!gl) return;
+        if (overlayTexRef.current) {
+            gl.deleteTexture(overlayTexRef.current);
+            overlayTexRef.current = null;
+        }
+        if (overlayVolume) overlayTexRef.current = create3DTexture(gl, overlayVolume, false);
+    }, [overlayVolume]);
+
     // Render Loop
     useEffect(() => {
         const gl = glRef.current;
@@ -1105,22 +1263,20 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
                 gl.uniform1i(gl.getUniformLocation(prog, 'u_segmentation'), 1);
             }
 
-            // Calculate Physical Aspect Ratio Box
-            // Header pixDims: [?, dx, dy, dz, ...]
-            // Default to 1 if missing
-            const pixDims = volume.header?.pixDims || [1,1,1,1];
-            // Safe fallback if pixDims are all 0 or header structure differs
-            const dx = pixDims[1] || 1;
-            const dy = pixDims[2] || 1;
-            const dz = pixDims[3] || 1;
+            const overlay = overlayVolRef.current;
+            gl.uniform1i(gl.getUniformLocation(prog, 'u_hasOverlay'), overlayTexRef.current ? 1 : 0);
+            gl.uniform1f(gl.getUniformLocation(prog, 'u_overlayOpacity'), overlayOpacityRef.current);
+            if (overlayTexRef.current && overlay) {
+                gl.activeTexture(gl.TEXTURE2);
+                gl.bindTexture(gl.TEXTURE_3D, overlayTexRef.current);
+                gl.uniform1i(gl.getUniformLocation(prog, 'u_overlay'), 2);
+                gl.uniform2f(gl.getUniformLocation(prog, 'u_overlayRange'), overlay.min, overlay.max);
+            } else {
+                gl.uniform2f(gl.getUniformLocation(prog, 'u_overlayRange'), 0, 1);
+            }
 
             const [dimX, dimY, dimZ] = volume.dimensions;
-            const physX = dimX * dx;
-            const physY = dimY * dy;
-            const physZ = dimZ * dz;
-            const maxDim = Math.max(physX, physY, physZ);
-            
-            const boxSize = [physX / maxDim, physY / maxDim, physZ / maxDim];
+            const worldToTex = displayWorldToTexColumnMajor(volume);
 
             const radAz = rotationRef.current.az * Math.PI / 180;
             const radEl = rotationRef.current.el * Math.PI / 180;
@@ -1138,7 +1294,7 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
 
             gl.uniformMatrix4fv(gl.getUniformLocation(prog, 'u_invViewRot'), false, new Float32Array(invViewRot));
             gl.uniform3f(gl.getUniformLocation(prog, 'u_dims'), dimX, dimY, dimZ);
-            gl.uniform3f(gl.getUniformLocation(prog, 'u_boxSize'), boxSize[0], boxSize[1], boxSize[2]);
+            gl.uniformMatrix4fv(gl.getUniformLocation(prog, 'u_worldToTex'), false, worldToTex);
             const wl = wlRef.current;
             if (wl) {
                 const { lo, hi } = windowBounds(wl);
@@ -1165,7 +1321,7 @@ const Volume3DViewer = React.memo(forwardRef<HTMLCanvasElement, Volume3DViewerPr
         render();
         return () => cancelAnimationFrame(rAF);
 
-    }, [volume, segmentation]);
+    }, [volume, segmentation, overlayVolume]);
 
     const normalize = (v: number[]) => { const l = Math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]); return [v[0]/l, v[1]/l, v[2]/l]; };
     const cross = (a: number[], b: number[]) => [a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0]];
@@ -1413,6 +1569,7 @@ export const Viewport = forwardRef<ViewportHandle, ViewportProps>((props, ref) =
     const [localPos, setLocalPos] = useState({ x: 0, y: 0, z: 0 });
     const [measurements, setMeasurements] = useState<SliceMeasurement[]>([]);
     const [focusPlane, setFocusPlane] = useState<SliceOrientation>('Axial');
+    const [defer3D, setDefer3D] = useState(viewMode !== ViewMode.ThreeD);
     const measureIdRef = useRef(1);
     const pos = position || localPos;
     const gridKey = `${volume?.dimensions.join('x')}|${(volume?.affine ?? []).slice(0, 12).join(',')}`;
@@ -1421,6 +1578,22 @@ export const Viewport = forwardRef<ViewportHandle, ViewportProps>((props, ref) =
         setMeasurements([]);
         measureIdRef.current = 1;
     }, [gridKey]);
+
+    useEffect(() => {
+        if (viewMode === ViewMode.ThreeD) {
+            setDefer3D(false);
+            return;
+        }
+        setDefer3D(true);
+        let inner = 0;
+        const outer = window.requestAnimationFrame(() => {
+            inner = window.requestAnimationFrame(() => setDefer3D(false));
+        });
+        return () => {
+            window.cancelAnimationFrame(outer);
+            window.cancelAnimationFrame(inner);
+        };
+    }, [gridKey, viewMode]);
 
     useEffect(() => {
         const onKey = (e: KeyboardEvent) => {
@@ -1442,36 +1615,34 @@ export const Viewport = forwardRef<ViewportHandle, ViewportProps>((props, ref) =
                 return;
             }
             if (!enableSliceKeys || !volume) return;
-            const [dimX, dimY, dimZ] = volume.dimensions;
             const plane: SliceOrientation =
                 viewMode === ViewMode.Axial ? 'Axial'
                 : viewMode === ViewMode.Coronal ? 'Coronal'
                 : viewMode === ViewMode.Sagittal ? 'Sagittal'
                 : focusPlane;
+            const mpr = buildMprPlane(volume, plane, pos, displayConvention);
             const axis = plane === 'Axial' ? 'z' : plane === 'Coronal' ? 'y' : 'x';
-            const max = axis === 'z' ? dimZ : axis === 'y' ? dimY : dimX;
+            const count = mpr ? mpr.sliceCount : volume.dimensions[axis === 'z' ? 2 : axis === 'y' ? 1 : 0];
             const step = e.shiftKey ? 10 : 1;
             let delta = 0;
             if (e.key === 'ArrowUp' || e.key === 'PageUp' || e.key === ',' || e.key === '<') delta = -step;
             else if (e.key === 'ArrowDown' || e.key === 'PageDown' || e.key === '.' || e.key === '>') delta = step;
             else if (e.key === 'Home') {
                 e.preventDefault();
-                handlePosChange({ ...pos, [axis]: 0 });
+                handlePosChange(setAnatomicalSlice(volume, plane, pos, 0, displayConvention));
                 return;
             } else if (e.key === 'End') {
                 e.preventDefault();
-                handlePosChange({ ...pos, [axis]: max - 1 });
+                handlePosChange(setAnatomicalSlice(volume, plane, pos, count - 1, displayConvention));
                 return;
             }
             if (!delta) return;
             e.preventDefault();
-            const cur = axis === 'z' ? pos.z : axis === 'y' ? pos.y : pos.x;
-            const next = Math.max(0, Math.min(max - 1, cur + delta));
-            handlePosChange({ ...pos, [axis]: next });
+            handlePosChange(stepAnatomicalSlice(volume, plane, pos, delta, displayConvention));
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
-    }, [tool, volume, viewMode, focusPlane, pos, enableSliceKeys, cinePlaying, onCinePlayingChange]);
+    }, [tool, volume, viewMode, focusPlane, pos, enableSliceKeys, cinePlaying, onCinePlayingChange, displayConvention]);
 
     const commitMeasurement = (
         orientation: SliceOrientation,
@@ -1541,14 +1712,17 @@ export const Viewport = forwardRef<ViewportHandle, ViewportProps>((props, ref) =
         }
         
         const [dimX, dimY, dimZ] = volume.dimensions;
+        const cx = Math.round(x);
+        const cy = Math.round(y);
+        const cz = Math.round(z);
         const r2 = radius * radius;
         for(let dz = -radius; dz <= radius; dz++) {
             for(let dy = -radius; dy <= radius; dy++) {
                 for(let dx = -radius; dx <= radius; dx++) {
                      if (dx*dx + dy*dy + dz*dz <= r2) {
-                         const px = x + dx; 
-                         const py = y + dy; 
-                         const pz = z + dz;
+                         const px = cx + dx; 
+                         const py = cy + dy; 
+                         const pz = cz + dz;
                          if (px>=0 && px<dimX && py>=0 && py<dimY && pz>=0 && pz<dimZ) {
                              const idx = pz*dimX*dimY + py*dimX + px;
                              segVol.data[idx] = val;
@@ -1567,16 +1741,20 @@ export const Viewport = forwardRef<ViewportHandle, ViewportProps>((props, ref) =
         if (!volume) return [];
         const urls: string[] = [];
         for (const idx of sliceIndices) {
-            const bmp = generateSliceBitmap(
-                volume,
-                segmentation ?? null,
-                orientation,
-                idx,
-                colormap || 'grayscale',
-                opacity ?? 1,
-                windowLevel,
-                sliceFlipH(orientation, volume, displayConvention)
-            );
+            const at = setAnatomicalSlice(volume, orientation, pos, idx, displayConvention);
+            const plane = buildMprPlane(volume, orientation, at, displayConvention);
+            const bmp = plane
+                ? generateMprSliceBitmap(volume, segmentation ?? null, plane, colormap || 'grayscale', windowLevel)
+                : generateSliceBitmap(
+                    volume,
+                    segmentation ?? null,
+                    orientation,
+                    idx,
+                    colormap || 'grayscale',
+                    opacity ?? 1,
+                    windowLevel,
+                    sliceFlipH(orientation, volume, displayConvention)
+                );
             if (!bmp) continue;
             const url = canvasToJpegDataUrl(bmp);
             if (url) urls.push(url);
@@ -1593,7 +1771,6 @@ export const Viewport = forwardRef<ViewportHandle, ViewportProps>((props, ref) =
     posRef.current = pos;
     useEffect(() => {
         if (!cinePlaying || !volume || viewMode === ViewMode.ThreeD) return;
-        const [dimX, dimY, dimZ] = volume.dimensions;
         const id = window.setInterval(() => {
             const p = posRef.current;
             const plane: SliceOrientation =
@@ -1601,23 +1778,24 @@ export const Viewport = forwardRef<ViewportHandle, ViewportProps>((props, ref) =
                 : viewMode === ViewMode.Coronal ? 'Coronal'
                 : viewMode === ViewMode.Sagittal ? 'Sagittal'
                 : focusPlane;
-            if (plane === 'Axial') handlePosChange({ ...p, z: (p.z + 1) % dimZ });
-            else if (plane === 'Coronal') handlePosChange({ ...p, y: (p.y + 1) % dimY });
-            else handlePosChange({ ...p, x: (p.x + 1) % dimX });
+            handlePosChange(stepAnatomicalSlice(volume, plane, p, 1, displayConvention));
         }, 80);
         return () => window.clearInterval(id);
-    }, [cinePlaying, volume, viewMode, focusPlane]);
+    }, [cinePlaying, volume, viewMode, focusPlane, displayConvention]);
 
     useImperativeHandle(ref, () => ({
         undoPaint,
         getReportImages: async (): Promise<ReportImages> => {
             if (!volume) return { axial: [], coronal: [], sagittal: [], threeD: [] };
             const [dimX, dimY, dimZ] = volume.dimensions;
+            const axialP = buildMprPlane(volume, 'Axial', pos, displayConvention);
+            const coronalP = buildMprPlane(volume, 'Coronal', pos, displayConvention);
+            const sagittalP = buildMprPlane(volume, 'Sagittal', pos, displayConvention);
             const three = captureWebglJpeg(canvas3DRef.current);
             return {
-                axial: capturePlane('Axial', pickSnapshotIndices(dimZ, pos.z)),
-                coronal: capturePlane('Coronal', pickSnapshotIndices(dimY, pos.y)),
-                sagittal: capturePlane('Sagittal', pickSnapshotIndices(dimX, pos.x)),
+                axial: capturePlane('Axial', pickSnapshotIndices(axialP?.sliceCount ?? dimZ, axialP?.sliceIndex ?? pos.z)),
+                coronal: capturePlane('Coronal', pickSnapshotIndices(coronalP?.sliceCount ?? dimY, coronalP?.sliceIndex ?? pos.y)),
+                sagittal: capturePlane('Sagittal', pickSnapshotIndices(sagittalP?.sliceCount ?? dimX, sagittalP?.sliceIndex ?? pos.x)),
                 threeD: three ? [three] : []
             };
         }
@@ -1626,26 +1804,32 @@ export const Viewport = forwardRef<ViewportHandle, ViewportProps>((props, ref) =
     if (!volume) return <div className="flex items-center justify-center h-full text-gray-600">No Volume Loaded</div>;
 
     const [dimX, dimY, dimZ] = volume.dimensions;
+    const axialMpr = buildMprPlane(volume, 'Axial', pos, displayConvention);
+    const coronalMpr = buildMprPlane(volume, 'Coronal', pos, displayConvention);
+    const sagittalMpr = buildMprPlane(volume, 'Sagittal', pos, displayConvention);
 
     const renderAxial = () => (
         <SliceViewer 
             title="Axial" orientation="Axial" color="#ef4444" isActive={true}
             volume={volume} segmentation={segmentation}
-            slice={pos.z} maxSlice={dimZ}
-            onSliceChange={(s) => handlePosChange({...pos, z: s})}
+            slice={axialMpr?.sliceIndex ?? pos.z} maxSlice={axialMpr?.sliceCount ?? dimZ}
+            onSliceChange={(s) => handlePosChange(setAnatomicalSlice(volume, 'Axial', pos, s, displayConvention))}
             onCrosshairChange={(u,v) => handlePosChange({...pos, x: u, y: v})}
             crosshair={{x: pos.x, y: pos.y}}
             tool={tool || 'crosshair'} brushSize={brushSize || 5} brushLabel={brushLabel}
             onDraw={handleDraw} onPaintStrokeStart={snapshotPaint}
-            flipH={sliceFlipH('Axial', volume, displayConvention)}
+            flipH={axialMpr ? false : sliceFlipH('Axial', volume, displayConvention)}
             colormap={colormap} opacity={opacity}
             overlayVolume={overlayVolume} overlayOpacity={overlayOpacity} overlayColormap={overlayColormap}
             onDoubleClickLayout={() => toggleLayout(ViewMode.Axial)}
             measurements={measurements}
-            onCommitMeasurement={(start, end) => commitMeasurement('Axial', pos.z, start, end)}
+            onCommitMeasurement={(start, end) => commitMeasurement('Axial', axialMpr?.sliceIndex ?? pos.z, start, end)}
             windowLevel={windowLevel}
             onWindowLevelChange={onWindowLevelChange}
             onActivate={() => setFocusPlane('Axial')}
+            mpr={axialMpr}
+            voxelPos={pos}
+            onVoxelPosChange={handlePosChange}
         />
     );
 
@@ -1653,21 +1837,24 @@ export const Viewport = forwardRef<ViewportHandle, ViewportProps>((props, ref) =
         <SliceViewer 
             title="Coronal" orientation="Coronal" color="#22c55e" isActive={true}
             volume={volume} segmentation={segmentation}
-            slice={pos.y} maxSlice={dimY}
-            onSliceChange={(s) => handlePosChange({...pos, y: s})}
+            slice={coronalMpr?.sliceIndex ?? pos.y} maxSlice={coronalMpr?.sliceCount ?? dimY}
+            onSliceChange={(s) => handlePosChange(setAnatomicalSlice(volume, 'Coronal', pos, s, displayConvention))}
             onCrosshairChange={(u,v) => handlePosChange({...pos, x: u, z: v})}
             crosshair={{x: pos.x, y: pos.z}}
             tool={tool || 'crosshair'} brushSize={brushSize || 5} brushLabel={brushLabel}
             onDraw={handleDraw} onPaintStrokeStart={snapshotPaint}
-            flipH={sliceFlipH('Coronal', volume, displayConvention)}
+            flipH={coronalMpr ? false : sliceFlipH('Coronal', volume, displayConvention)}
             colormap={colormap} opacity={opacity}
             overlayVolume={overlayVolume} overlayOpacity={overlayOpacity} overlayColormap={overlayColormap}
             onDoubleClickLayout={() => toggleLayout(ViewMode.Coronal)}
             measurements={measurements}
-            onCommitMeasurement={(start, end) => commitMeasurement('Coronal', pos.y, start, end)}
+            onCommitMeasurement={(start, end) => commitMeasurement('Coronal', coronalMpr?.sliceIndex ?? pos.y, start, end)}
             windowLevel={windowLevel}
             onWindowLevelChange={onWindowLevelChange}
             onActivate={() => setFocusPlane('Coronal')}
+            mpr={coronalMpr}
+            voxelPos={pos}
+            onVoxelPosChange={handlePosChange}
         />
     );
 
@@ -1675,21 +1862,24 @@ export const Viewport = forwardRef<ViewportHandle, ViewportProps>((props, ref) =
          <SliceViewer 
             title="Sagittal" orientation="Sagittal" color="#3b82f6" isActive={true}
             volume={volume} segmentation={segmentation}
-            slice={pos.x} maxSlice={dimX}
-            onSliceChange={(s) => handlePosChange({...pos, x: s})}
+            slice={sagittalMpr?.sliceIndex ?? pos.x} maxSlice={sagittalMpr?.sliceCount ?? dimX}
+            onSliceChange={(s) => handlePosChange(setAnatomicalSlice(volume, 'Sagittal', pos, s, displayConvention))}
             onCrosshairChange={(u,v) => handlePosChange({...pos, y: u, z: v})} 
             crosshair={{x: pos.y, y: pos.z}}
             tool={tool || 'crosshair'} brushSize={brushSize || 5} brushLabel={brushLabel}
             onDraw={handleDraw} onPaintStrokeStart={snapshotPaint}
-            flipH={sliceFlipH('Sagittal', volume, displayConvention)}
+            flipH={sagittalMpr ? false : sliceFlipH('Sagittal', volume, displayConvention)}
             colormap={colormap} opacity={opacity}
             overlayVolume={overlayVolume} overlayOpacity={overlayOpacity} overlayColormap={overlayColormap}
             onDoubleClickLayout={() => toggleLayout(ViewMode.Sagittal)}
             measurements={measurements}
-            onCommitMeasurement={(start, end) => commitMeasurement('Sagittal', pos.x, start, end)}
+            onCommitMeasurement={(start, end) => commitMeasurement('Sagittal', sagittalMpr?.sliceIndex ?? pos.x, start, end)}
             windowLevel={windowLevel}
             onWindowLevelChange={onWindowLevelChange}
             onActivate={() => setFocusPlane('Sagittal')}
+            mpr={sagittalMpr}
+            voxelPos={pos}
+            onVoxelPosChange={handlePosChange}
         />
     );
     
@@ -1697,7 +1887,9 @@ export const Viewport = forwardRef<ViewportHandle, ViewportProps>((props, ref) =
         <Volume3DViewer 
             ref={canvas3DRef}
             volume={volume} 
-            segmentation={segmentation} 
+            segmentation={segmentation}
+            overlayVolume={overlayVolume}
+            overlayOpacity={overlayOpacity}
             crosshair={pos}
             onDoubleClickLayout={() => toggleLayout(ViewMode.ThreeD)}
             windowLevel={windowLevel}
@@ -1799,10 +1991,14 @@ export const Viewport = forwardRef<ViewportHandle, ViewportProps>((props, ref) =
                     <div className="mb-1 text-[9px] uppercase tracking-wide text-gray-500">Measurements</div>
                     <div className="space-y-0.5">
                         {measurements.slice(-8).map((m) => {
-                            const mm = measurementLengthMm(
-                                volume, m.orientation, m.slice, m.start, m.end,
-                                sliceFlipH(m.orientation, volume, displayConvention)
-                            );
+                            const at = setAnatomicalSlice(volume, m.orientation, pos, m.slice, displayConvention);
+                            const plane = buildMprPlane(volume, m.orientation, at, displayConvention);
+                            const mm = plane
+                                ? mprMeasurementMm(plane, m.start, m.end)
+                                : measurementLengthMm(
+                                    volume, m.orientation, m.slice, m.start, m.end,
+                                    sliceFlipH(m.orientation, volume, displayConvention)
+                                );
                             const short = m.orientation.slice(0, 3);
                             return (
                                 <button
@@ -1810,9 +2006,7 @@ export const Viewport = forwardRef<ViewportHandle, ViewportProps>((props, ref) =
                                     type="button"
                                     title={`Go to ${m.orientation} slice ${m.slice + 1}`}
                                     onClick={() => {
-                                        if (m.orientation === 'Axial') handlePosChange({ ...pos, z: m.slice });
-                                        else if (m.orientation === 'Coronal') handlePosChange({ ...pos, y: m.slice });
-                                        else handlePosChange({ ...pos, x: m.slice });
+                                        handlePosChange(setAnatomicalSlice(volume, m.orientation, pos, m.slice, displayConvention));
                                     }}
                                     className="flex w-full items-center justify-between gap-3 rounded px-1 py-0.5 text-left font-mono text-[10px] text-cyan-200 hover:bg-gray-800"
                                 >
@@ -1845,7 +2039,7 @@ export const Viewport = forwardRef<ViewportHandle, ViewportProps>((props, ref) =
             {renderAxial()}
             {renderCoronal()}
             {renderSagittal()}
-            {render3D()}
+            {defer3D ? <div className="relative w-full h-full bg-black" /> : render3D()}
         </div>
     );
 });

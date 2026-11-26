@@ -35,6 +35,20 @@ export const computeVolumeDifference = (volA: VolumeData, volB: VolumeData): Vol
     };
 };
 
+/** Resample `source` onto `reference` when grids or affines differ; otherwise return source. */
+export const alignVolumeToReference = (source: VolumeData, reference: VolumeData): VolumeData => {
+    const sizeMatch =
+        source.dimensions[0] === reference.dimensions[0] &&
+        source.dimensions[1] === reference.dimensions[1] &&
+        source.dimensions[2] === reference.dimensions[2];
+    if (source.affine && reference.affine) {
+        const affineMatch = sizeMatch && maxAbsDiffMat4(source.affine, reference.affine) < AFFINE_EQ_TOL_MM;
+        if (affineMatch) return source;
+        return resampleScalarVolumeOntoReference(source, reference) ?? source;
+    }
+    return source;
+};
+
 /**
  * Aligns follow-up onto baseline voxel grid when affines differ (trilinear).
  * Falls back to same-grid subtraction when geometry matches or resampling is unavailable.

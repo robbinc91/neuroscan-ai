@@ -1,6 +1,7 @@
 import type { VolumeData } from '../types';
 import { correctN4BiasField } from './n4BiasCorrection';
 import { gaussianSmooth3D, medianFilter3D, localAdaptiveGaussianMask, claheVolume, tvDenoise3D } from './volumeFilters';
+import { voxelSpacingMm } from './volumeMetadata';
 
 export type ProcessMethodId =
     | 'hist_eq'
@@ -39,6 +40,7 @@ export interface VolumeProcessInput {
     refData?: ArrayLike<number>;
     refMin?: number;
     refMax?: number;
+    highAccuracy?: boolean;
     onProgress?: (pct: number) => void | Promise<void>;
 }
 
@@ -93,7 +95,8 @@ export async function processVolumeData(input: VolumeProcessInput): Promise<Volu
         };
         const result = await correctN4BiasField(volume, {
             meshSpacingMm: param1,
-            iterationsPerLevel: Math.max(1, Math.round(param2))
+            iterationsPerLevel: Math.max(1, Math.round(param2)),
+            highAccuracy: input.highAccuracy
         }, onProgress);
         return {
             data: result.data,
@@ -121,8 +124,21 @@ export async function processVolumeData(input: VolumeProcessInput): Promise<Volu
     }
 
     if (method === 'unsharp') {
-        const sigma = Math.max(0.3, param2 || 1);
-        const blurred = await gaussianSmooth3D(data, dimensions, sigma, async (pct) => {
+        const sigmaMm = Math.max(0.3, param2 || 1);
+        const spacing = voxelSpacingMm({
+            header: { pixDims: input.pixDims ?? [1, 1, 1, 1] },
+            data: data as Float32Array,
+            dimensions,
+            min,
+            max,
+            affine: input.affine
+        });
+        const sigmaVoxels: [number, number, number] = [
+            sigmaMm / Math.max(1e-3, spacing[0]),
+            sigmaMm / Math.max(1e-3, spacing[1]),
+            sigmaMm / Math.max(1e-3, spacing[2])
+        ];
+        const blurred = await gaussianSmooth3D(data, dimensions, sigmaVoxels, async (pct) => {
             await report(Math.floor(pct * 0.9));
         });
         const strength = param1;

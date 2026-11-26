@@ -1,8 +1,8 @@
 import { app, BrowserWindow, ipcMain, dialog, Menu, shell } from 'electron';
-import { join, dirname } from 'path';
+import { join, dirname, basename, extname } from 'path';
 import { fileURLToPath } from 'url';
 import Store from 'electron-store';
-import { mkdir, readFile, writeFile } from 'fs/promises';
+import { mkdir, readFile, writeFile, readdir, open } from 'fs/promises';
 
 // ES module __dirname equivalent
 const __filename = fileURLToPath(import.meta.url);
@@ -170,6 +170,13 @@ function createMenu() {
                     }
                 },
                 {
+                    label: 'Import Folder / DICOMDIR...',
+                    accelerator: 'CmdOrCtrl+Shift+F',
+                    click: () => {
+                        mainWindow?.webContents.send('menu-import-folder');
+                    }
+                },
+                {
                     label: 'Import Segmentation...',
                     accelerator: 'CmdOrCtrl+Shift+O',
                     click: () => {
@@ -213,7 +220,14 @@ function createMenu() {
         {
             label: 'Edit',
             submenu: [
-                { role: 'undo' },
+                {
+                    label: 'Undo',
+                    accelerator: 'CmdOrCtrl+Z',
+                    registerAccelerator: false,
+                    click: () => {
+                        mainWindow?.webContents.send('menu-undo');
+                    }
+                },
                 { role: 'redo' },
                 { type: 'separator' },
                 { role: 'cut' },
@@ -275,13 +289,13 @@ function createMenu() {
                 {
                     label: 'Documentation',
                     click: () => {
-                        shell.openExternal('https://github.com/yourusername/neuroscan-ai');
+                        shell.openExternal('https://github.com/robbinc91/neuroscan-ai');
                     }
                 },
                 {
                     label: 'Report Issue',
                     click: () => {
-                        shell.openExternal('https://github.com/yourusername/neuroscan-ai/issues');
+                        shell.openExternal('https://github.com/robbinc91/neuroscan-ai/issues');
                     }
                 }
             ]
@@ -328,6 +342,73 @@ ipcMain.handle('dialog:openFile', async (_, options?: {
     );
 
     return files;
+});
+
+async function looksLikeDicom(filePath: string): Promise<boolean> {
+    const name = basename(filePath).toLowerCase();
+    if (name === 'dicomdir' || name.endsWith('.dcm') || name.endsWith('.ima') || name.endsWith('.dicom')) return true;
+    const ext = extname(name);
+    if (ext && ext !== '.') return false;
+    try {
+        const fh = await open(filePath, 'r');
+        const buf = Buffer.alloc(132);
+        const { bytesRead } = await fh.read(buf, 0, 132, 0);
+        await fh.close();
+        if (bytesRead < 132) return false;
+        return buf.slice(128, 132).toString('ascii') === 'DICM';
+    } catch {
+        return false;
+    }
+}
+
+async function walkMedicalFiles(root: string, out: string[], depth = 0): Promise<void> {
+    if (depth > 8 || out.length > 8000) return;
+    let entries;
+    try {
+        entries = await readdir(root, { withFileTypes: true });
+    } catch {
+        return;
+    }
+    for (const e of entries) {
+        if (e.name.startsWith('.')) continue;
+        const p = join(root, e.name);
+        if (e.isDirectory()) {
+            if (e.name === 'node_modules') continue;
+            await walkMedicalFiles(p, out, depth + 1);
+            continue;
+        }
+        const n = e.name.toLowerCase();
+        if (n.endsWith('.nii') || n.endsWith('.nii.gz') || n.endsWith('.hdr') || n.endsWith('.gz')) {
+            out.push(p);
+            continue;
+        }
+        if (await looksLikeDicom(p)) out.push(p);
+    }
+}
+
+ipcMain.handle('fs:readMedicalFolder', async (_, dirPath?: string) => {
+    if (!mainWindow) return null;
+    let root = dirPath;
+    if (!root) {
+        const result = await dialog.showOpenDialog(mainWindow, {
+            properties: ['openDirectory']
+        });
+        if (result.canceled || result.filePaths.length === 0) return null;
+        root = result.filePaths[0];
+    }
+    const paths: string[] = [];
+    await walkMedicalFiles(root, paths);
+    const files = await Promise.all(
+        paths.map(async (filePath) => {
+            const buffer = await readFile(filePath);
+            return {
+                name: filePath.split(/[\\/]/).pop() || 'unknown',
+                path: filePath,
+                data: buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
+            };
+        })
+    );
+    return { root, files };
 });
 
 // File Dialog - Save file

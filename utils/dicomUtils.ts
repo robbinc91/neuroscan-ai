@@ -26,20 +26,83 @@ function median(values: number[]): number {
     return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
 
-function pickLargestSeriesInstance(images: DaikonImage[]): { selected: DaikonImage[]; note: string } {
+export interface DicomSeriesChoice {
+    uid: string;
+    label: string;
+    modality?: string;
+    description?: string;
+    count: number;
+    rows?: number;
+    cols?: number;
+}
+
+function groupBySeries(images: DaikonImage[]): Map<string, DaikonImage[]> {
     const byUid = new Map<string, DaikonImage[]>();
     for (const im of images) {
         const uid = String(im.getSeriesInstanceUID?.() ?? 'UNKNOWN');
         if (!byUid.has(uid)) byUid.set(uid, []);
         byUid.get(uid)!.push(im);
     }
+    return byUid;
+}
+
+function seriesChoice(uid: string, images: DaikonImage[]): DicomSeriesChoice {
+    const first = images[0];
+    const description = String(first?.getSeriesDescription?.() || first?.getSeriesNumber?.() || '').trim();
+    const modality = String(first?.getModality?.() || '').trim() || undefined;
+    const shortUid = uid.length > 18 ? uid.slice(-12) : uid;
+    const label = [modality, description || `Series ${shortUid}`, `${images.length} img`]
+        .filter(Boolean)
+        .join(' · ');
+    return {
+        uid,
+        label,
+        modality,
+        description: description || undefined,
+        count: images.length,
+        rows: first?.getRows?.(),
+        cols: first?.getCols?.()
+    };
+}
+
+export function listDicomSeries(buffers: ArrayBuffer[]): DicomSeriesChoice[] {
+    const images = parseDicomImages(buffers);
+    const grouped = groupBySeries(images);
+    return [...grouped.entries()]
+        .map(([uid, imgs]) => seriesChoice(uid, imgs))
+        .sort((a, b) => b.count - a.count);
+}
+
+function parseDicomImages(buffers: ArrayBuffer[]): DaikonImage[] {
+    const rawImages: DaikonImage[] = [];
+    for (const buffer of buffers) {
+        try {
+            const dataView = new DataView(buffer);
+            const image = daikon.Series.parseImage(dataView);
+            if (image && image.hasPixelData()) rawImages.push(image);
+        } catch (e) {
+            console.warn('Failed to parse a DICOM file', e);
+        }
+    }
+    return rawImages;
+}
+
+function pickSeriesImages(images: DaikonImage[], seriesUid?: string): { selected: DaikonImage[]; note: string } {
+    const byUid = groupBySeries(images);
+    if (seriesUid && byUid.has(seriesUid)) {
+        return { selected: byUid.get(seriesUid)!, note: byUid.size > 1 ? `series_uid:${seriesUid}` : '' };
+    }
     let best: DaikonImage[] = [];
-    for (const arr of byUid.values()) {
-        if (arr.length > best.length) best = arr;
+    let bestUid = '';
+    for (const [uid, arr] of byUid.entries()) {
+        if (arr.length > best.length) {
+            best = arr;
+            bestUid = uid;
+        }
     }
     const note =
         byUid.size > 1
-            ? `multi_series_input: used largest series (${best.length} images of ${byUid.size} UIDs)`
+            ? `multi_series_input: auto-picked largest (${best.length} images, uid …${bestUid.slice(-8)} of ${byUid.size} series)`
             : '';
     return { selected: best, note };
 }
@@ -103,26 +166,17 @@ function buildLpsAffineFromDicom(
     ];
 }
 
-export const parseDicomFiles = (buffers: ArrayBuffer[]): VolumeData | null => {
+export const parseDicomFiles = (buffers: ArrayBuffer[], seriesUid?: string): VolumeData | null => {
     if (!buffers || buffers.length === 0) return null;
 
-    const rawImages: DaikonImage[] = [];
-    for (const buffer of buffers) {
-        try {
-            const dataView = new DataView(buffer);
-            const image = daikon.Series.parseImage(dataView);
-            if (image && image.hasPixelData()) rawImages.push(image);
-        } catch (e) {
-            console.warn('Failed to parse a DICOM file', e);
-        }
-    }
+    const rawImages = parseDicomImages(buffers);
 
     if (rawImages.length === 0) {
         console.error('No valid DICOM images found');
         return null;
     }
 
-    const { selected: seriesImages, note: seriesNote } = pickLargestSeriesInstance(rawImages);
+    const { selected: seriesImages, note: seriesNote } = pickSeriesImages(rawImages, seriesUid);
 
     const series = new daikon.Series();
     for (const im of seriesImages) {
